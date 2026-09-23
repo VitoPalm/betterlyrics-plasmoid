@@ -3,6 +3,9 @@
     <kcfgfile name=""/>
 
     <group name="General">
+        <entry name="enabled" type="Bool">
+            <default>true</default>
+        </entry>
         <entry name="fontFamily" type="String">
             <default>Noto Sans</default>
         </entry>

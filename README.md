@@ -26,6 +26,10 @@ After installing, reload a running panel if needed with
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for the editing workflow. This repository
 is local; add your own Git remote when you want to publish or sync it.
 
+Right-click the widget and choose **Stop Better Lyrics** to suspend lyric
+fetching and playback polling. Choose **Start Better Lyrics** from the same
+menu to resume. The choice is saved for that widget instance.
+
 ## Lyrics pipeline
 
 `contents/ui/lyrics_service.py` runs two generation-guarded lookups for each

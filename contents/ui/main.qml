@@ -13,6 +13,13 @@ PlasmoidItem {
 
     preferredRepresentation: fullRepresentation
     Plasmoid.backgroundHints: PlasmaCore.Types.NoBackground
+    Plasmoid.contextualActions: [
+        PlasmaCore.Action {
+            text: root.cfgEnabled ? i18n("Stop Better Lyrics") : i18n("Start Better Lyrics")
+            icon.name: root.cfgEnabled ? "media-playback-stop" : "media-playback-start"
+            onTriggered: Plasmoid.configuration.enabled = !root.cfgEnabled
+        }
+    ]
 
     Layout.fillWidth: true
     Layout.fillHeight: true
@@ -49,6 +56,7 @@ PlasmoidItem {
     property string trackUrl: ""
 
     // Configuration properties
+    readonly property bool cfgEnabled: Plasmoid.configuration.enabled !== false
     readonly property string cfgFontFamily: {
         const configured = Plasmoid.configuration.fontFamily || "Noto Sans";
         const candidates = configured.split(",");
@@ -86,6 +94,7 @@ PlasmoidItem {
     RunCommand {
         id: sharedColorReader
         onExited: (cmd, exitCode, exitStatus, stdout, stderr) => {
+            if (!root.cfgEnabled) return;
             try {
                 const record = JSON.parse(stdout.trim());
                 const expectedKey = encodeURIComponent(root.trackTitle + "\u001f"
@@ -104,7 +113,7 @@ PlasmoidItem {
 
     Timer {
         interval: 1250
-        running: root.isPlaying && root.cfgUseAlbumColor
+        running: root.cfgEnabled && root.isPlaying && root.cfgUseAlbumColor
         repeat: true
         triggeredOnStart: true
         onTriggered: {
@@ -119,6 +128,7 @@ PlasmoidItem {
     RunCommand {
         id: trackUrlReader
         onExited: (cmd, exitCode, exitStatus, stdout, stderr) => {
+            if (!root.cfgEnabled) return;
             const val = stdout.trim();
             if (val !== root.trackUrl) {
                 root.trackUrl = val;
@@ -127,6 +137,7 @@ PlasmoidItem {
     }
 
     function refreshTrackUrl() {
+        if (!cfgEnabled) return;
         const encodedTitle = encodeURIComponent(trackTitle).replace(/'/g, "%27");
         const encodedArtist = encodeURIComponent(trackArtist).replace(/'/g, "%27");
         trackUrlReader.run("python3 '" + trackUrlScriptPath.replace(/'/g, "'\\''") + "' '"
@@ -135,7 +146,7 @@ PlasmoidItem {
 
     Timer {
         interval: 1000
-        running: root.isPlaying
+        running: root.cfgEnabled && root.isPlaying
         repeat: true
         triggeredOnStart: true
         onTriggered: root.refreshTrackUrl()
@@ -143,7 +154,7 @@ PlasmoidItem {
 
     Kirigami.ImageColors {
         id: albumColors
-        source: root.trackArtUrl
+        source: root.cfgEnabled ? root.trackArtUrl : ""
     }
 
     readonly property color albumArtBaseColor: sharedAlbumArtReady
@@ -221,7 +232,7 @@ PlasmoidItem {
     }
 
     function applyBackendResult(payload) {
-        if (!payload || payload.requestToken !== String(requestGeneration)
+        if (!cfgEnabled || !payload || payload.requestToken !== String(requestGeneration)
                 || !payload.ok || !payload.result || !payload.result.lines
                 || payload.result.lines.length === 0) {
             return false;
@@ -248,7 +259,8 @@ PlasmoidItem {
     }
 
     function startLegacyFallback(token) {
-        if (legacyFallbackStarted || backendQuality >= 0 || token !== String(requestGeneration)) return;
+        if (!cfgEnabled || legacyFallbackStarted || backendQuality >= 0
+                || token !== String(requestGeneration)) return;
         legacyFallbackStarted = true;
         const expectedGeneration = requestGeneration;
         const expectedKey = lastLoadedTrackKey;
@@ -286,7 +298,7 @@ PlasmoidItem {
     }
 
     // Disappear completely if song is paused OR if lyrics weren't found
-    readonly property bool shouldBeVisible: root.isPlaying && root.lyricsList.length > 0
+    readonly property bool shouldBeVisible: root.cfgEnabled && root.isPlaying && root.lyricsList.length > 0
 
     // Smooth karaoke locally; querying DBus every frame is expensive and can
     // stall Plasma when a remote MPRIS player is slow.
@@ -330,7 +342,7 @@ PlasmoidItem {
     Timer {
         id: positionTimer
         interval: 33
-        running: root.isPlaying
+        running: root.cfgEnabled && root.isPlaying
         repeat: true
         onTriggered: {
             var now = Date.now();
@@ -354,6 +366,7 @@ PlasmoidItem {
     }
 
     function triggerSongChange(clearExisting) {
+        if (!cfgEnabled) return;
         requestGeneration += 1;
         if (clearExisting) {
             root.lyricsList = [];
@@ -374,7 +387,28 @@ PlasmoidItem {
     onTrackDurationChanged: triggerSongChange(true)
     onPlayerChanged: triggerSongChange(true)
     onTrackArtUrlChanged: sharedAlbumArtReady = false
+    onCfgEnabledChanged: {
+        requestGeneration += 1;
+        songDebounceTimer.stop();
+        lastLoadedTrackKey = "";
+        isLoadingLyrics = false;
+        if (cfgEnabled) {
+            if (isPlaying) {
+                resetPositionClock((player?.position || 0) / 1000.0, Date.now());
+                lastPositionProbeTime = 0;
+                refreshTrackUrl();
+                triggerSongChange(true);
+            }
+        } else {
+            lyricsList = [];
+            activeLineIndex = -1;
+            trackUrl = "";
+            positionClockInitialized = false;
+            sharedAlbumArtReady = false;
+        }
+    }
     onIsPlayingChanged: {
+        if (!cfgEnabled) return;
         if (isPlaying) {
             resetPositionClock((player?.position || 0) / 1000.0, Date.now());
             lastPositionProbeTime = 0;
@@ -390,7 +424,7 @@ PlasmoidItem {
     }
 
     function executeSongFetch() {
-        if (!isPlaying || !trackTitle) {
+        if (!cfgEnabled || !isPlaying || !trackTitle) {
             lyricsList = [];
             lastLoadedTrackKey = "";
             isLoadingLyrics = false;
@@ -524,9 +558,9 @@ PlasmoidItem {
             Plasmoid.configuration.timingOffsetMs = -legacyOffset;
             Plasmoid.configuration.timingOffsetSemanticsVersion = 1;
         }
-        if (isPlaying) {
+        if (cfgEnabled && isPlaying) {
             refreshTrackUrl();
         }
-        triggerSongChange(true);
+        if (cfgEnabled) triggerSongChange(true);
     }
 }
