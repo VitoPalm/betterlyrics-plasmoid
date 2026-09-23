@@ -1,0 +1,20 @@
+{
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Vito Palmieri",
+                "Email": ""
+            }
+        ],
+        "Category": "Multimedia",
+        "Description": "Better Lyrics visualizer with syllable-by-syllable sync, dynamic album colors, and responsive height",
+        "Icon": "view-media-lyrics",
+        "Id": "org.kde.plasma.betterlyrics",
+        "License": "GPL-3.0",
+        "Name": "Better Lyrics",
+        "Version": "1.2.0",
+        "Website": "https://github.com/VitoPalm/betterlyrics-plasmoid"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "KPackageStructure": "Plasma/Applet"
+}

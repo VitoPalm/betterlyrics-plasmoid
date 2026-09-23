@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+dist/
+*.plasmoid
+*~
+*.swp
+# Local research and review logs contain machine-specific notes. The public
+# architecture and workflow live in README.md and CONTRIBUTING.md.
+DOCUMENTATION.md
+ENERGY-RESEARCH-*.md
+REVIEW-*.md
