@@ -7,6 +7,7 @@ Item {
     property int durationMs: 5000
     property double currentPositionMs: 0
     property bool isLineActive: false
+    property bool playbackActive: true
 
     property color activeColor: "#FFFFFF"
     property color inactiveColor: Qt.rgba(1, 1, 1, 0.35)
@@ -67,7 +68,7 @@ Item {
                 }
 
                 SequentialAnimation on scale {
-                    running: instRoot.isLineActive
+                    running: instRoot.isLineActive && instRoot.playbackActive
                     loops: Animation.Infinite
                     PauseAnimation { duration: index * 180 }
                     NumberAnimation { to: 1.25; duration: 400; easing.type: Easing.InOutQuad }

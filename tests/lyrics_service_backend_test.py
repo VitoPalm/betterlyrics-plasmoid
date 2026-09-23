@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 import contextlib
+import json
+import os
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -14,8 +18,6 @@ from read_album_color import color_for_key
 
 class LyricsBackendTests(unittest.TestCase):
     def test_shared_album_color_cache_is_optional_and_keyed(self):
-        import tempfile
-
         with tempfile.TemporaryDirectory() as temporary:
             cache = Path(temporary) / "album-color.json"
             self.assertIsNone(color_for_key("song", cache))
@@ -24,6 +26,24 @@ class LyricsBackendTests(unittest.TestCase):
             self.assertEqual(color_for_key("song", cache),
                              {"color": "#ab12cd", "source_key": "song"})
             self.assertIsNone(color_for_key("different-song", cache))
+            cache.write_text('{"algorithm":"raw-average-v2","records":'
+                             '{"song":{"color":"#202326"}}}')
+            self.assertIsNone(color_for_key("song", cache))
+
+    def test_color_reader_accepts_generation_argument(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / ".cache/plasma-album-color.txt"
+            cache.parent.mkdir()
+            cache.write_text('{"algorithm":"raw-average-v2","records":'
+                             '{"song":{"color":"#Ab12Cd"}}}')
+            env = dict(os.environ, HOME=temporary)
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "contents/ui/read_album_color.py"),
+                 "song", "--generation", "7"],
+                env=env, capture_output=True, text=True, check=True,
+            )
+            self.assertEqual(json.loads(result.stdout),
+                             {"color": "#ab12cd", "source_key": "song"})
 
     def test_lrc_repeated_timestamps_and_words(self):
         lines = service.parse_lrc(

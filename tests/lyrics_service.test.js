@@ -63,6 +63,17 @@ assert.equal(context.adjustedPositionMs(10000, -250), 10250); // negative = earl
 assert.equal(context.reconcilePositionMs(10000, 9900, 45, 1200), 9955);
 assert.equal(context.reconcilePositionMs(10000, 7000, 45, 1200), 7000); // seek
 
+const timeline = [
+    { startTimeMs: 1000, durationMs: 1500 },
+    { startTimeMs: 2000, durationMs: 1000 }
+];
+assert.equal(context.nextTimelineDelayMs(timeline, 0, 1500, 1), 500); // overlapping next line
+assert.equal(context.nextTimelineDelayMs(timeline, 0, 1500, 2), 250); // playback rate
+assert.equal(context.nextTimelineDelayMs(timeline, 1, 3000, 1), 0); // no further work
+assert.equal(context.nextTimelineDelayMs(
+    [{ startTimeMs: 0, durationMs: 3000, isInstrumental: true }], 0, 100, 1
+), 900); // next instrumental dot
+
 const enriched = { lines: [{ words: "世界" }, { words: "Hello" }] };
 assert.equal(context.applyRomanizations(enriched, [{ index: 0, text: "世界" }], ["shì jiè"]), true);
 assert.equal(enriched.lines[0].romanization, "shì jiè");

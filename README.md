@@ -101,6 +101,14 @@ the package design.
    `LyricsStreamView.qml` at 220 px or above. Clicking a timed line seeks the
    active MPRIS player.
 
+The widget checks the track URL and shared album-color cache on player or
+artwork changes, with short retries for late metadata and a 15-second
+reconciliation check. The 33 ms lyric clock runs only while an active timed
+line is filling; line-only transitions are scheduled at their next boundary.
+MPRIS position corrections retain the original 250 ms cadence while lyrics
+are visible, preserving seek responsiveness even with players that omit seek
+signals. The unused lyric layout is not instantiated.
+
 The Python service does not maintain application data. Its only project-specific
 local read is the Zen extension cache; `libsnappy` is loaded from the system.
 Python tooling may generate `__pycache__` bytecode. The QML package stores user

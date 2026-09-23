@@ -59,6 +59,29 @@ function adjustedPositionMs(playbackPositionMs, lyricDelayMs) {
     return Math.max(0, position - delay);
 }
 
+// Return the next static visual change. Word fills keep their own animation
+// clock; line-only lyrics need to wake only at boundaries and break markers.
+function nextTimelineDelayMs(lines, activeIndex, positionMs, playbackRate) {
+    var position = Number(positionMs) || 0;
+    var next = Number.POSITIVE_INFINITY;
+    for (var i = 0; i < lines.length; i++) {
+        var start = Number(lines[i].startTimeMs) || 0;
+        var end = start + (Number(lines[i].durationMs) || 0);
+        if (start > position && start < next) next = start;
+        if (end > position && end < next) next = end;
+    }
+    var line = lines[activeIndex];
+    if (line && line.isInstrumental && line.durationMs > 0) {
+        for (var dot = 1; dot <= 2; dot++) {
+            var threshold = line.startTimeMs + line.durationMs * dot / 3;
+            if (threshold > position && threshold < next) next = threshold;
+        }
+    }
+    if (!isFinite(next)) return 0;
+    var rate = Math.max(0.1, Number(playbackRate) || 1);
+    return Math.max(16, Math.min(60000, Math.ceil((next - position) / rate)));
+}
+
 // MPRIS samples arrive much less often than the animation clock. Snap on real
 // seeks, but gently converge small sample errors to avoid a backward jump on
 // every position probe.

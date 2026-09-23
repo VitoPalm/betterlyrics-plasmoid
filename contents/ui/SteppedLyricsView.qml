@@ -5,6 +5,7 @@ Item {
 
     property var lyricsList: []
     property int activeLineIndex: -1
+    property bool playbackActive: true
     property double currentPositionMs: 0
 
     property color activeColor: "#FFFFFF"
@@ -91,10 +92,11 @@ Item {
         fontBold: steppedRoot.fontBold
         fontItalic: steppedRoot.fontItalic
         enableWobble: false
+        playbackActive: steppedRoot.playbackActive
         enableShadow: steppedRoot.enableShadow
         enableRomanization: steppedRoot.enableRomanization
         romanizationOpacity: steppedRoot.romanizationOpacity
-        currentPositionMs: steppedRoot.currentPositionMs
+        currentPositionMs: 0
     }
 
     // 2. Active line (main singing lyric, syllable-synced / karaoke)
@@ -113,6 +115,7 @@ Item {
         fontBold: steppedRoot.fontBold
         fontItalic: steppedRoot.fontItalic
         enableWobble: steppedRoot.enableWobble
+        playbackActive: steppedRoot.playbackActive
         enableShadow: steppedRoot.enableShadow
         enableRomanization: steppedRoot.enableRomanization
         romanizationOpacity: steppedRoot.romanizationOpacity
@@ -139,10 +142,11 @@ Item {
         fontBold: steppedRoot.fontBold
         fontItalic: steppedRoot.fontItalic
         enableWobble: false
+        playbackActive: steppedRoot.playbackActive
         enableShadow: steppedRoot.enableShadow
         enableRomanization: steppedRoot.enableRomanization
         romanizationOpacity: steppedRoot.romanizationOpacity
-        currentPositionMs: steppedRoot.currentPositionMs
+        currentPositionMs: 0
 
         onLineClicked: function(timeMs) {
             steppedRoot.lineClicked(timeMs);

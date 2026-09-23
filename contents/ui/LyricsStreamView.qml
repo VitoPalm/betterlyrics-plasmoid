@@ -5,6 +5,7 @@ Item {
 
     property var lyricsList: []
     property int activeLineIndex: -1
+    property bool playbackActive: true
     property double currentPositionMs: 0
 
     property color activeColor: "#FFFFFF"
@@ -72,7 +73,9 @@ Item {
                     lineParts: modelData ? (swapRomanization ? [] : (modelData.parts || [])) : []
                     isInstrumental: modelData ? (modelData.isInstrumental || false) : false
                     isUnsynced: modelData ? (modelData.isUnsynced || false) : false
-                    currentPositionMs: streamRoot.currentPositionMs
+                    // Inactive lines never fill words, so leave them out of
+                    // the high-frequency position binding.
+                    currentPositionMs: isLineActive ? streamRoot.currentPositionMs : 0
 
                     isLineActive: index === streamRoot.activeLineIndex
                     isPrevLine: index === (streamRoot.activeLineIndex - 1)
@@ -85,6 +88,7 @@ Item {
                     fontBold: streamRoot.fontBold
                     fontItalic: streamRoot.fontItalic
                     enableWobble: streamRoot.enableWobble
+                    playbackActive: streamRoot.playbackActive
                     enableShadow: streamRoot.enableShadow
                     enableRomanization: streamRoot.enableRomanization
                     romanizationOpacity: streamRoot.romanizationOpacity

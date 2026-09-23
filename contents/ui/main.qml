@@ -1,3 +1,5 @@
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import QtQuick.Layouts
 
@@ -90,11 +92,38 @@ PlasmoidItem {
     // Optional shared color cache, with the artwork average as fallback.
     property color sharedAlbumArtColor: Kirigami.Theme.highlightColor
     property bool sharedAlbumArtReady: false
+    property int colorLookupGeneration: 0
+    property int colorRetryCount: 0
+    property int colorInFlightGeneration: -1
+
+    function scheduleColorLookup() {
+        colorLookupGeneration += 1;
+        colorRetryCount = 0;
+        colorRetryTimer.stop();
+        sharedAlbumArtReady = false;
+        if (cfgEnabled && isPlaying && cfgUseAlbumColor) {
+            colorRetryTimer.interval = 16;
+            colorRetryTimer.restart();
+        }
+    }
+
+    function refreshAlbumColor() {
+        if (!cfgEnabled || !isPlaying || !cfgUseAlbumColor
+                || colorInFlightGeneration === colorLookupGeneration) return;
+        const key = encodeURIComponent(trackTitle + "\u001f" + trackArtist
+                                       + "\u001f" + trackArtUrl).replace(/'/g, "%27");
+        colorInFlightGeneration = colorLookupGeneration;
+        sharedColorReader.run("python3 '" + sharedColorScriptPath.replace(/'/g, "'\\''")
+                              + "' '" + key + "' --generation " + colorLookupGeneration);
+    }
 
     RunCommand {
         id: sharedColorReader
         onExited: (cmd, exitCode, exitStatus, stdout, stderr) => {
-            if (!root.cfgEnabled) return;
+            const match = cmd.match(/ --generation (\d+)$/);
+            const generation = match ? Number(match[1]) : -1;
+            if (root.colorInFlightGeneration === generation) root.colorInFlightGeneration = -1;
+            if (!root.cfgEnabled || generation !== root.colorLookupGeneration) return;
             try {
                 const record = JSON.parse(stdout.trim());
                 const expectedKey = encodeURIComponent(root.trackTitle + "\u001f"
@@ -108,52 +137,93 @@ PlasmoidItem {
             } catch (error) {
                 // Missing and legacy cache files fall back to ImageColors.
             }
-        }
-    }
-
-    Timer {
-        interval: 1250
-        running: root.cfgEnabled && root.isPlaying && root.cfgUseAlbumColor
-        repeat: true
-        triggeredOnStart: true
-        onTriggered: {
-            const key = encodeURIComponent(root.trackTitle + "\u001f" + root.trackArtist
-                                            + "\u001f" + root.trackArtUrl).replace(/'/g, "%27");
-            sharedColorReader.run("python3 '" + sharedColorScriptPath.replace(/'/g, "'\\''")
-                                  + "' '" + key + "'");
-        }
-    }
-
-    // Direct DBus xesam:url reader to supply videoId for Unison
-    RunCommand {
-        id: trackUrlReader
-        onExited: (cmd, exitCode, exitStatus, stdout, stderr) => {
-            if (!root.cfgEnabled) return;
-            const val = stdout.trim();
-            if (val !== root.trackUrl) {
-                root.trackUrl = val;
+            // The external writer may publish a temporary background color
+            // before the artwork average. Keep checking briefly after a hit.
+            if (root.colorRetryCount < 8) {
+                const delays = [250, 750, 1250, 1250, 1250, 1250, 1250, 1250];
+                colorRetryTimer.interval = delays[root.colorRetryCount++];
+                colorRetryTimer.restart();
             }
         }
     }
 
-    function refreshTrackUrl() {
-        if (!cfgEnabled) return;
-        const encodedTitle = encodeURIComponent(trackTitle).replace(/'/g, "%27");
-        const encodedArtist = encodeURIComponent(trackArtist).replace(/'/g, "%27");
-        trackUrlReader.run("python3 '" + trackUrlScriptPath.replace(/'/g, "'\\''") + "' '"
-                           + encodedTitle + "' '" + encodedArtist + "'");
+    Timer {
+        id: colorRetryTimer
+        interval: 16
+        onTriggered: root.refreshAlbumColor()
     }
 
     Timer {
-        interval: 1000
-        running: root.cfgEnabled && root.isPlaying
+        interval: 15000
+        running: root.cfgEnabled && root.isPlaying && root.cfgUseAlbumColor
         repeat: true
-        triggeredOnStart: true
+        onTriggered: root.refreshAlbumColor()
+    }
+
+    // Direct DBus xesam:url reader to supply videoId for Unison
+    property int trackUrlLookupGeneration: 0
+    property int trackUrlRetryCount: 0
+    property int trackUrlInFlightGeneration: -1
+
+    RunCommand {
+        id: trackUrlReader
+        onExited: (cmd, exitCode, exitStatus, stdout, stderr) => {
+            const match = cmd.match(/ --generation (\d+)$/);
+            const generation = match ? Number(match[1]) : -1;
+            if (root.trackUrlInFlightGeneration === generation) root.trackUrlInFlightGeneration = -1;
+            if (!root.cfgEnabled || generation !== root.trackUrlLookupGeneration) return;
+            const val = stdout.trim();
+            if (val && val !== root.trackUrl) {
+                root.trackUrl = val;
+            }
+            if (!val && root.trackUrlRetryCount < 4) {
+                const delays = [250, 500, 1000, 2000];
+                trackUrlRetryTimer.interval = delays[root.trackUrlRetryCount++];
+                trackUrlRetryTimer.restart();
+            }
+        }
+    }
+
+    function scheduleTrackUrlLookup(clearKnown) {
+        trackUrlLookupGeneration += 1;
+        trackUrlRetryCount = 0;
+        trackUrlRetryTimer.stop();
+        if (clearKnown !== false) trackUrl = "";
+        if (cfgEnabled && isPlaying && trackTitle) {
+            trackUrlRetryTimer.interval = 16;
+            trackUrlRetryTimer.restart();
+        }
+    }
+
+    function refreshTrackUrl() {
+        if (!cfgEnabled || !isPlaying || !trackTitle
+                || trackUrlInFlightGeneration === trackUrlLookupGeneration) return;
+        const encodedTitle = encodeURIComponent(trackTitle).replace(/'/g, "%27");
+        const encodedArtist = encodeURIComponent(trackArtist).replace(/'/g, "%27");
+        trackUrlInFlightGeneration = trackUrlLookupGeneration;
+        trackUrlReader.run("python3 '" + trackUrlScriptPath.replace(/'/g, "'\\''") + "' '"
+                           + encodedTitle + "' '" + encodedArtist + "' --generation "
+                           + trackUrlLookupGeneration);
+    }
+
+    Timer {
+        id: trackUrlRetryTimer
+        interval: 16
+        onTriggered: root.refreshTrackUrl()
+    }
+
+    Timer {
+        interval: 15000
+        running: root.cfgEnabled && root.isPlaying && !!root.trackTitle
+        repeat: true
         onTriggered: root.refreshTrackUrl()
     }
 
     Kirigami.ImageColors {
         id: albumColors
+        // Keep the source stable while a shared-cache lookup completes. Kirigami
+        // processes images asynchronously; clearing a pending source on every
+        // cache hit can crash plasmashell on the next artwork change.
         source: root.cfgEnabled ? root.trackArtUrl : ""
     }
 
@@ -183,10 +253,11 @@ PlasmoidItem {
     property double currentTrackPositionMs: 0
     property double lastMprisPositionMs: 0
     property double lastUpdateTime: 0
-    property double lastPositionProbeTime: 0
     property double positionAnchorMs: 0
     property double positionAnchorTime: 0
+    property double positionPlaybackRate: 1
     property bool positionClockInitialized: false
+    property bool awaitingTrackPositionSample: false
 
     // Positive settings delay lyrics; negative settings advance them. This is
     // the same direction used by Better Lyrics' browser extension.
@@ -199,6 +270,17 @@ PlasmoidItem {
     property string lyricsSyncType: ""
     property bool isLoadingLyrics: false
     property int activeLineIndex: -1
+    readonly property bool activeLineHasParts: {
+        if (activeLineIndex < 0 || activeLineIndex >= lyricsList.length) return false;
+        const line = lyricsList[activeLineIndex];
+        const swapRomanization = cfgEnableRomanization && cfgRomanizationPrimary
+                                 && !!(line.romanization || "").trim();
+        if (swapRomanization || !line.parts?.length) return false;
+        const lastPart = line.parts[line.parts.length - 1];
+        const fillEnd = Math.max(line.startTimeMs + line.durationMs,
+                                 (lastPart.startTimeMs || 0) + (lastPart.durationMs || 0));
+        return adjustedPositionMs >= line.startTimeMs && adjustedPositionMs < fillEnd;
+    }
 
     property string lastLoadedTrackKey: ""
     property string lastFetchedTitle: ""
@@ -245,13 +327,13 @@ PlasmoidItem {
         lyricsSource = result.source || "";
         lyricsSyncType = result.syncType || "";
         isLoadingLyrics = false;
-        updateActiveLine();
+        refreshTimeline();
         if (cfgEnableRomanization) {
             const expectedGeneration = requestGeneration;
             LyricsService.enrichRomanization(result, LyricsService.extractVideoId(trackUrl), function(err, enriched) {
                 if (!err && expectedGeneration === requestGeneration && enriched?.lines) {
                     lyricsList = enriched.lines.slice(0);
-                    updateActiveLine();
+                    refreshTimeline();
                 }
             });
         }
@@ -272,7 +354,7 @@ PlasmoidItem {
                 lyricsList = result.lines.slice(0);
                 lyricsSource = result.source || "";
                 lyricsSyncType = result.syncType || "";
-                updateActiveLine();
+                refreshTimeline();
             } else if (backendQuality < 0 && (err || !result?.lines?.length)) {
                 lyricsList = [];
             }
@@ -309,14 +391,22 @@ PlasmoidItem {
         currentTrackPositionMs = safePosition;
         lastMprisPositionMs = safePosition;
         lastUpdateTime = now;
+        positionPlaybackRate = Math.max(0.1, Number(player?.rate || 1));
         positionClockInitialized = true;
+        awaitingTrackPositionSample = false;
     }
 
     function projectPositionAt(now) {
         if (!positionClockInitialized) return 0;
-        const playbackRate = Math.max(0.1, Number(root.player?.rate || 1));
-        const projected = positionAnchorMs + Math.max(0, now - positionAnchorTime) * playbackRate;
+        const projected = positionAnchorMs + Math.max(0, now - positionAnchorTime) * positionPlaybackRate;
         return trackDuration > 0 ? Math.min(projected, trackDuration * 1000) : projected;
+    }
+
+    function reanchorForTrack() {
+        if (!cfgEnabled || !isPlaying) return;
+        resetPositionClock((player?.position || 0) / 1000.0, Date.now());
+        awaitingTrackPositionSample = true;
+        player?.updatePosition();
     }
 
     function updatePositionClock(now, force) {
@@ -339,21 +429,97 @@ PlasmoidItem {
         }
     }
 
+    function scheduleTimelineWake() {
+        timelineWakeTimer.stop();
+        if (!cfgEnabled || !isPlaying || lyricsList.length === 0 || activeLineHasParts) return;
+
+        const now = Date.now();
+        const position = LyricsService.adjustedPositionMs(projectPositionAt(now), cfgTimingOffsetMs);
+        const delay = LyricsService.nextTimelineDelayMs(lyricsList, activeLineIndex,
+                                                        position, player?.rate || 1);
+        if (delay > 0) {
+            timelineWakeTimer.interval = delay;
+            timelineWakeTimer.start();
+        }
+    }
+
+    function refreshTimeline() {
+        if (!cfgEnabled || !isPlaying || lyricsList.length === 0) {
+            timelineWakeTimer.stop();
+            if (lyricsList.length === 0) activeLineIndex = -1;
+            return;
+        }
+        const now = Date.now();
+        if (!positionClockInitialized) {
+            resetPositionClock((player?.position || 0) / 1000.0, now);
+        } else {
+            updatePositionClock(now, false);
+        }
+        updateActiveLine();
+        scheduleTimelineWake();
+    }
+
     Timer {
         id: positionTimer
         interval: 33
-        running: root.cfgEnabled && root.isPlaying
+        running: root.cfgEnabled && root.isPlaying && root.activeLineHasParts
         repeat: true
         onTriggered: {
-            var now = Date.now();
-            if (now - root.lastPositionProbeTime >= 250) {
-                root.player?.updatePosition();
-                root.lastPositionProbeTime = now;
-            }
-            root.updatePositionClock(now, false);
+            root.updatePositionClock(Date.now(), false);
             root.updateActiveLine();
         }
     }
+
+    Timer {
+        id: positionProbeTimer
+        interval: 250
+        running: root.cfgEnabled && root.isPlaying && root.lyricsList.length > 0
+        repeat: true
+        onTriggered: {
+            root.player?.updatePosition();
+            root.refreshTimeline();
+        }
+    }
+
+    Timer {
+        id: timelineWakeTimer
+        interval: 1000
+        onTriggered: root.refreshTimeline()
+    }
+
+    Connections {
+        target: root.player
+        ignoreUnknownSignals: true
+        function onMetadataChanged() {
+            root.reanchorForTrack();
+            root.scheduleTrackUrlLookup(false);
+            root.refreshTimeline();
+        }
+        function onPositionChanged() {
+            if (!root.cfgEnabled || !root.isPlaying) return;
+            if (root.awaitingTrackPositionSample) {
+                root.resetPositionClock((root.player?.position || 0) / 1000.0, Date.now());
+            } else if (root.lyricsList.length === 0) {
+                root.updatePositionClock(Date.now(), false);
+            }
+            if (root.lyricsList.length > 0) root.refreshTimeline();
+        }
+        function onRateChanged() {
+            if (!root.cfgEnabled || !root.isPlaying) return;
+            const now = Date.now();
+            const projected = root.projectPositionAt(now);
+            root.positionAnchorMs = projected;
+            root.positionAnchorTime = now;
+            root.positionPlaybackRate = Math.max(0.1, Number(root.player?.rate || 1));
+            root.currentTrackPositionMs = projected;
+            root.player?.updatePosition();
+            root.refreshTimeline();
+        }
+    }
+
+    onActiveLineIndexChanged: scheduleTimelineWake()
+    onActiveLineHasPartsChanged: scheduleTimelineWake()
+    onLyricsListChanged: refreshTimeline()
 
     // Debounce timer to allow MPRIS metadata to fully settle across async DBus events
     Timer {
@@ -372,21 +538,36 @@ PlasmoidItem {
             root.lyricsList = [];
             root.activeLineIndex = -1;
         }
-        songDebounceTimer.restart();
+        if (isPlaying) songDebounceTimer.restart();
+        else songDebounceTimer.stop();
     }
 
     onTrackTitleChanged: {
-        sharedAlbumArtReady = false;
+        reanchorForTrack();
+        scheduleColorLookup();
+        scheduleTrackUrlLookup();
         triggerSongChange(true);
     }
     onTrackArtistChanged: {
-        sharedAlbumArtReady = false;
+        reanchorForTrack();
+        scheduleColorLookup();
+        scheduleTrackUrlLookup();
         triggerSongChange(true);
     }
     onTrackUrlChanged: triggerSongChange(false)
-    onTrackDurationChanged: triggerSongChange(true)
-    onPlayerChanged: triggerSongChange(true)
-    onTrackArtUrlChanged: sharedAlbumArtReady = false
+    onTrackDurationChanged: {
+        reanchorForTrack();
+        scheduleTrackUrlLookup(false);
+        triggerSongChange(true);
+    }
+    onPlayerChanged: {
+        reanchorForTrack();
+        scheduleColorLookup();
+        scheduleTrackUrlLookup();
+        triggerSongChange(true);
+    }
+    onTrackArtUrlChanged: scheduleColorLookup()
+    onCfgUseAlbumColorChanged: scheduleColorLookup()
     onCfgEnabledChanged: {
         requestGeneration += 1;
         songDebounceTimer.stop();
@@ -395,11 +576,15 @@ PlasmoidItem {
         if (cfgEnabled) {
             if (isPlaying) {
                 resetPositionClock((player?.position || 0) / 1000.0, Date.now());
-                lastPositionProbeTime = 0;
-                refreshTrackUrl();
+                scheduleTrackUrlLookup();
+                scheduleColorLookup();
                 triggerSongChange(true);
             }
         } else {
+            trackUrlLookupGeneration += 1;
+            colorLookupGeneration += 1;
+            trackUrlRetryTimer.stop();
+            colorRetryTimer.stop();
             lyricsList = [];
             activeLineIndex = -1;
             trackUrl = "";
@@ -411,14 +596,22 @@ PlasmoidItem {
         if (!cfgEnabled) return;
         if (isPlaying) {
             resetPositionClock((player?.position || 0) / 1000.0, Date.now());
-            lastPositionProbeTime = 0;
-            triggerSongChange(true);
-            refreshTrackUrl();
+            const key = (trackTitle + "---" + trackArtist + "---"
+                         + Math.round(trackDuration) + "---" + trackUrl).toLowerCase();
+            if (lyricsList.length === 0 || key !== lastLoadedTrackKey) {
+                triggerSongChange(true);
+            } else {
+                refreshTimeline();
+            }
+            if (!trackUrl) scheduleTrackUrlLookup();
+            if (!sharedAlbumArtReady) scheduleColorLookup();
         } else {
-            requestGeneration += 1;
             songDebounceTimer.stop();
+            trackUrlLookupGeneration += 1;
+            colorLookupGeneration += 1;
+            trackUrlRetryTimer.stop();
+            colorRetryTimer.stop();
             isLoadingLyrics = false;
-            trackUrl = "";
             positionClockInitialized = false;
         }
     }
@@ -481,11 +674,11 @@ PlasmoidItem {
         if (root.player) {
             root.player.position = timeMs * 1000;
             resetPositionClock(timeMs, Date.now());
-            updateActiveLine();
+            refreshTimeline();
         }
     }
 
-    onCfgTimingOffsetMsChanged: updateActiveLine()
+    onCfgTimingOffsetMsChanged: refreshTimeline()
 
     // Inner container: controls visibility & smooth fade without suspending PlasmoidItem in Corona
     Item {
@@ -499,15 +692,20 @@ PlasmoidItem {
             NumberAnimation { duration: 250; easing.type: Easing.InOutQuad }
         }
 
-        // 1. Stepped View (for height < 220px: animated sliding lines)
-        SteppedLyricsView {
+        Loader {
             anchors.fill: parent
-            visible: root.lyricsList.length > 0 && root.height < 220
+            active: root.lyricsList.length > 0
+            sourceComponent: root.height < 220 ? steppedViewComponent : streamViewComponent
+        }
+    }
 
+    Component {
+        id: steppedViewComponent
+        SteppedLyricsView {
             lyricsList: root.lyricsList
             activeLineIndex: root.activeLineIndex
+            playbackActive: root.isPlaying
             currentPositionMs: root.adjustedPositionMs
-
             activeColor: root.activeLyricColor
             inactiveColor: root.inactiveLyricColor
             fontFamily: root.cfgFontFamily
@@ -519,19 +717,17 @@ PlasmoidItem {
             enableRomanization: root.cfgEnableRomanization
             romanizationOpacity: root.cfgRomanizationOpacity
             romanizationPrimary: root.cfgRomanizationPrimary
-
             onLineClicked: function(timeMs) { root.handleLineClick(timeMs); }
         }
+    }
 
-        // 2. Flowing Stream View (for height >= 220px: desktop scroll view)
+    Component {
+        id: streamViewComponent
         LyricsStreamView {
-            anchors.fill: parent
-            visible: root.lyricsList.length > 0 && root.height >= 220
-
             lyricsList: root.lyricsList
             activeLineIndex: root.activeLineIndex
+            playbackActive: root.isPlaying
             currentPositionMs: root.adjustedPositionMs
-
             activeColor: root.activeLyricColor
             inactiveColor: root.inactiveLyricColor
             fontFamily: root.cfgFontFamily
@@ -543,7 +739,6 @@ PlasmoidItem {
             enableRomanization: root.cfgEnableRomanization
             romanizationOpacity: root.cfgRomanizationOpacity
             romanizationPrimary: root.cfgRomanizationPrimary
-
             onLineClicked: function(timeMs) { root.handleLineClick(timeMs); }
         }
     }
@@ -559,7 +754,8 @@ PlasmoidItem {
             Plasmoid.configuration.timingOffsetSemanticsVersion = 1;
         }
         if (cfgEnabled && isPlaying) {
-            refreshTrackUrl();
+            scheduleTrackUrlLookup();
+            scheduleColorLookup();
         }
         if (cfgEnabled) triggerSongChange(true);
     }

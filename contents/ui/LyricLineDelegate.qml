@@ -16,6 +16,7 @@ Item {
     property bool isPrevLine: false
     property bool isNextLine: false
     property bool forceSingleLine: false
+    property bool playbackActive: true
 
     property color activeColor: "#FFFFFF"
     property color inactiveColor: Qt.rgba(1, 1, 1, 0.35)
@@ -216,6 +217,7 @@ Item {
             durationMs: lineRoot.durationMs
             currentPositionMs: lineRoot.currentPositionMs
             isLineActive: lineRoot.isLineActive
+            playbackActive: lineRoot.playbackActive
             activeColor: lineRoot.activeColor
             inactiveColor: lineRoot.inactiveColor
             fontSize: lineRoot.renderedFontSize
