@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def main() -> None:
     output = ROOT / (sys.argv[1] if len(sys.argv) > 1 else "dist/org.kde.plasma.betterlyrics.plasmoid")
     output.parent.mkdir(parents=True, exist_ok=True)
-    files = [ROOT / "metadata.json"] + sorted(
+    files = [ROOT / "metadata.json", ROOT / "LICENSE"] + sorted(
         path for path in (ROOT / "contents").rglob("*")
         if path.is_file()
         and not any(part.startswith(".") or part == "__pycache__" for part in path.relative_to(ROOT).parts)

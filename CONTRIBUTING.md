@@ -13,8 +13,8 @@ there can be overwritten by the next install.
    use `make install` and `make preview` with an MPRIS player.
 4. Check `git status` before committing so generated files stay out of Git.
 
-`make package` creates `dist/org.kde.plasma.betterlyrics.plasmoid` from only
-`metadata.json` and `contents/`. The archive excludes docs, tests, caches, and
+`make package` creates `dist/org.kde.plasma.betterlyrics.plasmoid` from
+`metadata.json`, `LICENSE`, and `contents/`. The archive excludes docs, tests, caches, and
 local editor files. `make install` installs or upgrades that archive for the
 current user. A running Plasma panel may need `systemctl --user restart
 plasma-plasmashell.service` to reload QML. Save any panel state before doing so.
