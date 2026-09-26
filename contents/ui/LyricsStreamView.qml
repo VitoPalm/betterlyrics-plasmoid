@@ -7,6 +7,8 @@ Item {
     property int activeLineIndex: -1
     property bool playbackActive: true
     property double currentPositionMs: 0
+    property bool allowManualScroll: false
+    property bool manualBrowsing: false
 
     property color activeColor: "#FFFFFF"
     property color inactiveColor: Qt.rgba(1, 1, 1, 0.35)
@@ -30,8 +32,14 @@ Item {
         anchors.fill: parent
         contentWidth: width
         contentHeight: linesColumn.implicitHeight
-        interactive: false // Strictly autoscroll tracking the active line
+        interactive: streamRoot.allowManualScroll
         clip: true
+        onMovementStarted: {
+            if (streamRoot.allowManualScroll) {
+                streamRoot.manualBrowsing = true;
+                scrollAnim.stop();
+            }
+        }
 
         NumberAnimation {
             id: scrollAnim
@@ -112,6 +120,7 @@ Item {
     }
 
     onCurrentPositionMsChanged: {
+        if (manualBrowsing) return;
         if (activeLineIndex < 0 || activeLineIndex >= repeater.count) return;
         var item = repeater.itemAt(activeLineIndex);
         if (!item || item.height <= flickable.height) return;
@@ -125,6 +134,7 @@ Item {
     }
 
     function scrollToActiveLine() {
+        if (manualBrowsing) return;
         if (activeLineIndex < 0 || activeLineIndex >= repeater.count) return;
         var item = repeater.itemAt(activeLineIndex);
         if (!item) return;
@@ -145,6 +155,9 @@ Item {
 
     onWidthChanged: Qt.callLater(scrollToActiveLine)
     onLyricsListChanged: Qt.callLater(scrollToActiveLine)
+    onManualBrowsingChanged: {
+        if (!manualBrowsing) Qt.callLater(scrollToActiveLine);
+    }
     onFontSizeChanged: Qt.callLater(scrollToActiveLine)
     onFontFamilyChanged: Qt.callLater(scrollToActiveLine)
     onFontBoldChanged: Qt.callLater(scrollToActiveLine)

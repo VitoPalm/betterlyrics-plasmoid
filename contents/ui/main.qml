@@ -7,26 +7,98 @@ import org.kde.plasma.core as PlasmaCore
 import org.kde.plasma.plasmoid
 import org.kde.plasma.private.mpris as Mpris
 import org.kde.kirigami as Kirigami
+import org.kde.plasma.workspace.dbus as DBus
 
 import "LyricsService.js" as LyricsService
 
 PlasmoidItem {
     id: root
 
-    preferredRepresentation: fullRepresentation
-    Plasmoid.backgroundHints: PlasmaCore.Types.NoBackground
+    readonly property bool inPanel: Plasmoid.formFactor !== PlasmaCore.Types.Planar
+    preferredRepresentation: inPanel ? compactRepresentation : fullRepresentation
+    Plasmoid.backgroundHints: inPanel ? PlasmaCore.Types.DefaultBackground : PlasmaCore.Types.NoBackground
+    toolTipMainText: inPanel && currentPanelLyric ? currentPanelLyric
+                     : trackTitle || i18n("Better Lyrics")
+    toolTipSubText: !cfgEnabled ? ""
+                    : inPanel && currentPanelLyric ? trackTitle + (trackArtist ? " — " + trackArtist : "")
+                    : trackArtist || (isLoadingLyrics ? i18n("Loading lyrics") : "")
     Plasmoid.contextualActions: [
         PlasmaCore.Action {
             text: root.cfgEnabled ? i18n("Stop Better Lyrics") : i18n("Start Better Lyrics")
             icon.name: root.cfgEnabled ? "media-playback-stop" : "media-playback-start"
-            onTriggered: Plasmoid.configuration.enabled = !root.cfgEnabled
+            onTriggered: root.setEnabledForThisMode(!root.cfgEnabled)
         }
     ]
 
     Layout.fillWidth: true
     Layout.fillHeight: true
-    Layout.minimumWidth: 200
-    Layout.minimumHeight: 40
+    Layout.minimumWidth: inPanel ? 24 : 200
+    Layout.minimumHeight: inPanel ? 24 : 40
+
+    property bool globalStateReady: false
+    property bool globalEnabled: false
+    property int globalRevision: -1
+    readonly property string globalControlScriptPath: decodeURIComponent(
+        Qt.resolvedUrl("global_control.py").toString().replace(/^file:\/\//, ""))
+
+    function globalControlCommand(value) {
+        return "python3 '" + globalControlScriptPath.replace(/'/g, "'\\''") + "'"
+            + (value === undefined ? "" : " --set " + (value ? "true" : "false"));
+    }
+
+    function refreshGlobalEnabled() {
+        globalControlReader.run(globalControlCommand());
+    }
+
+    function setGlobalEnabled(value) {
+        globalControlReader.run(globalControlCommand(value));
+    }
+
+    function setEnabledForThisMode(value) {
+        if (cfgFollowsGlobal) setGlobalEnabled(value);
+        else Plasmoid.configuration.enabled = value;
+    }
+
+    RunCommand {
+        id: globalControlReader
+        onExited: (cmd, exitCode, exitStatus, stdout, stderr) => {
+            if (exitCode !== 0) return;
+            try {
+                const state = JSON.parse(stdout.trim());
+                if (typeof state.enabled !== "boolean" || !Number.isInteger(state.revision)
+                        || state.revision < root.globalRevision) return;
+                root.globalRevision = state.revision;
+                root.globalEnabled = state.enabled;
+                root.globalStateReady = true;
+            } catch (error) {}
+        }
+    }
+
+    DBus.SignalWatcher {
+        enabled: root.cfgFollowsGlobal
+        busType: DBus.BusType.Session
+        service: "org.kde.plasma.BetterLyrics.Control"
+        path: "/org/kde/plasma/BetterLyrics/Control"
+        iface: "org.kde.plasma.BetterLyrics.Control"
+        function dbusStateChanged(enabled, revision) {
+            root.refreshGlobalEnabled();
+        }
+        function dbusLyricsReady(key, payloadJson) {}
+    }
+
+    DBus.SignalWatcher {
+        busType: DBus.BusType.Session
+        service: "org.kde.plasma.BetterLyrics.Control"
+        path: "/org/kde/plasma/BetterLyrics/Control"
+        iface: "org.kde.plasma.BetterLyrics.Control"
+        function dbusLyricsReady(key, payloadJson) {
+            // The Plasma D-Bus decoder exposes strings as variant wrappers.
+            // Convert before strict key comparison and JSON parsing.
+            try { root.sharedPhaseResult(String(key), JSON.parse(String(payloadJson))); }
+            catch (error) {}
+        }
+        function dbusStateChanged(enabled, revision) {}
+    }
 
     Mpris.Mpris2Model {
         id: mpris2Model
@@ -58,7 +130,13 @@ PlasmoidItem {
     property string trackUrl: ""
 
     // Configuration properties
-    readonly property bool cfgEnabled: Plasmoid.configuration.enabled !== false
+    readonly property bool cfgFollowsGlobal: Plasmoid.configuration.followGlobalEnabled !== false
+    readonly property bool cfgEnabled: cfgFollowsGlobal
+                                       ? globalStateReady && globalEnabled
+                                       : Plasmoid.configuration.enabled !== false
+    onCfgFollowsGlobalChanged: {
+        if (cfgFollowsGlobal) refreshGlobalEnabled();
+    }
     readonly property string cfgFontFamily: {
         const configured = Plasmoid.configuration.fontFamily || "Noto Sans";
         const candidates = configured.split(",");
@@ -204,7 +282,8 @@ PlasmoidItem {
         trackUrlInFlightGeneration = trackUrlLookupGeneration;
         trackUrlReader.run("python3 '" + trackUrlScriptPath.replace(/'/g, "'\\''") + "' '"
                            + encodedTitle + "' '" + encodedArtist + "' --generation "
-                           + trackUrlLookupGeneration);
+                           + trackUrlLookupGeneration + " --pid "
+                           + Math.max(0, Number(player?.instancePid || 0)));
     }
 
     Timer {
@@ -271,6 +350,15 @@ PlasmoidItem {
     property string lyricsSyncType: ""
     property bool isLoadingLyrics: false
     property int activeLineIndex: -1
+    readonly property string currentPanelLyric: {
+        if (!cfgEnabled || !isPlaying || activeLineIndex < 0
+                || activeLineIndex >= lyricsList.length) return "";
+        const line = lyricsList[activeLineIndex];
+        if (line.isUnsynced) return "";
+        if (line.isInstrumental) return i18n("Instrumental");
+        return cfgEnableRomanization && cfgRomanizationPrimary && line.romanization
+            ? line.romanization : (line.words || "");
+    }
     readonly property bool activeLineHasParts: {
         if (activeLineIndex < 0 || activeLineIndex >= lyricsList.length) return false;
         const line = lyricsList[activeLineIndex];
@@ -286,10 +374,80 @@ PlasmoidItem {
     property string lastLoadedTrackKey: ""
     property string lastFetchedTitle: ""
     property string lastFetchedArtist: ""
+    property string lastFetchedUrl: ""
+    property int lastFetchedPlayerPid: 0
     property int requestGeneration: 0
     property int backendQuality: -1
     property int backendResultRevision: 0
     property bool legacyFallbackStarted: false
+    property int pendingBackendPhases: 0
+    property string sharedLookupKey: ""
+    property var sharedCompletedPhases: ({})
+    property bool sharedLookupActive: false
+
+    function sharedLookupCommand(key) {
+        return globalControlCommand() + " --lookup"
+            + " --key '" + encodedArgument(key) + "'"
+            + " --title '" + encodedArgument(trackTitle) + "'"
+            + " --artist '" + encodedArgument(trackArtist) + "'"
+            + " --album '" + encodedArgument(trackAlbum) + "'"
+            + " --duration " + Math.max(0, trackDuration)
+            + " --video-id '" + encodedArgument(LyricsService.extractVideoId(trackUrl)) + "'";
+    }
+
+    function sharedPhaseResult(key, payload) {
+        if (!sharedLookupActive || !cfgEnabled || key !== sharedLookupKey
+                || !payload || !payload.phase
+                || sharedCompletedPhases[payload.phase]) return;
+        const completed = Object.assign({}, sharedCompletedPhases);
+        completed[payload.phase] = true;
+        sharedCompletedPhases = completed;
+        const localPayload = Object.assign({}, payload, {requestToken: String(requestGeneration)});
+        if (!applyBackendResult(localPayload) && payload.phase === "fast" && payload.error)
+            startLegacyFallback(String(requestGeneration));
+        pendingBackendPhases = Math.max(0, pendingBackendPhases - 1);
+        if (pendingBackendPhases === 0 && !legacyFallbackStarted) isLoadingLyrics = false;
+    }
+
+    function startLocalBackendSearch() {
+        sharedLookupActive = false;
+        const token = String(requestGeneration);
+        fastLyricsReader.run(backendCommand("fast", token));
+        richLyricsReader.run(backendCommand("rich", token));
+        if (LyricsService.extractVideoId(trackUrl)) {
+            youtubeLyricsReader.run(backendCommand("youtube", token));
+            browserBridgeReader.run(backendCommand("bridge", token));
+        }
+    }
+
+    RunCommand {
+        id: sharedLyricsReader
+        onExited: (cmd, exitCode, exitStatus, stdout, stderr) => {
+            const keyMatch = cmd.match(/--key '([^']+)'/);
+            const key = keyMatch ? decodeURIComponent(keyMatch[1]) : "";
+            if (!root.sharedLookupActive || key !== root.sharedLookupKey) return;
+            try {
+                if (exitCode !== 0) throw new Error("Shared lookup failed");
+                const response = JSON.parse(stdout.trim());
+                if (response.key !== key || !Array.isArray(response.results)
+                        || response.expected !== root.pendingBackendPhases +
+                            Object.keys(root.sharedCompletedPhases).length)
+                    throw new Error("Invalid shared lookup response");
+                for (const payload of response.results) root.sharedPhaseResult(key, payload);
+            } catch (error) {
+                root.sharedLookupActive = false;
+                root.pendingBackendPhases = LyricsService.extractVideoId(root.trackUrl) ? 4 : 2;
+                root.startLocalBackendSearch();
+            }
+        }
+    }
+
+    function backendPhaseDone(cmd) {
+        const match = cmd.match(/--request-token '([^']+)'/);
+        if (!match || match[1] !== String(requestGeneration)) return;
+        pendingBackendPhases = Math.max(0, pendingBackendPhases - 1);
+        if (pendingBackendPhases === 0 && !legacyFallbackStarted) isLoadingLyrics = false;
+    }
 
     readonly property string backendScriptPath: decodeURIComponent(
         Qt.resolvedUrl("lyrics_service.py").toString().replace(/^file:\/\//, ""))
@@ -376,6 +534,7 @@ PlasmoidItem {
             if (!root.applyBackendResult(payload) && (!payload || payload.error)) {
                 root.startLegacyFallback(token);
             }
+            root.backendPhaseDone(cmd);
         }
     }
 
@@ -383,6 +542,7 @@ PlasmoidItem {
         id: richLyricsReader
         onExited: (cmd, exitCode, exitStatus, stdout, stderr) => {
             try { root.applyBackendResult(JSON.parse(stdout.trim())); } catch (error) {}
+            root.backendPhaseDone(cmd);
         }
     }
 
@@ -390,6 +550,7 @@ PlasmoidItem {
         id: youtubeLyricsReader
         onExited: (cmd, exitCode, exitStatus, stdout, stderr) => {
             try { root.applyBackendResult(JSON.parse(stdout.trim())); } catch (error) {}
+            root.backendPhaseDone(cmd);
         }
     }
 
@@ -397,6 +558,7 @@ PlasmoidItem {
         id: browserBridgeReader
         onExited: (cmd, exitCode, exitStatus, stdout, stderr) => {
             try { root.applyBackendResult(JSON.parse(stdout.trim())); } catch (error) {}
+            root.backendPhaseDone(cmd);
         }
     }
 
@@ -484,6 +646,7 @@ PlasmoidItem {
         id: positionTimer
         interval: 33
         running: root.cfgEnabled && root.isPlaying && root.activeLineHasParts
+                 && (!root.inPanel || root.expanded)
         repeat: true
         onTriggered: {
             root.updatePositionClock(Date.now(), false);
@@ -495,6 +658,8 @@ PlasmoidItem {
         id: positionProbeTimer
         interval: 250
         running: root.cfgEnabled && root.isPlaying && root.lyricsList.length > 0
+                 && (!root.inPanel || root.expanded
+                     || Plasmoid.formFactor === PlasmaCore.Types.Horizontal)
         repeat: true
         onTriggered: {
             root.player?.updatePosition();
@@ -541,6 +706,12 @@ PlasmoidItem {
     onActiveLineIndexChanged: scheduleTimelineWake()
     onActiveLineHasPartsChanged: scheduleTimelineWake()
     onLyricsListChanged: refreshTimeline()
+    onExpandedChanged: {
+        if (root.expanded && root.cfgEnabled && root.isPlaying) {
+            player?.updatePosition();
+            refreshTimeline();
+        }
+    }
 
     // Debounce timer to allow MPRIS metadata to fully settle across async DBus events
     Timer {
@@ -558,6 +729,7 @@ PlasmoidItem {
         if (clearExisting) {
             root.lyricsList = [];
             root.activeLineIndex = -1;
+            root.isLoadingLyrics = false;
         }
         if (isPlaying) songDebounceTimer.restart();
         else songDebounceTimer.stop();
@@ -579,7 +751,7 @@ PlasmoidItem {
     onTrackDurationChanged: {
         reanchorForTrack();
         scheduleTrackUrlLookup(false);
-        triggerSongChange(true);
+        triggerSongChange(false);
     }
     onPlayerChanged: {
         reanchorForTrack();
@@ -591,9 +763,11 @@ PlasmoidItem {
     onCfgUseAlbumColorChanged: scheduleColorLookup()
     onCfgEnabledChanged: {
         requestGeneration += 1;
+        sharedLookupActive = false;
         songDebounceTimer.stop();
         lastLoadedTrackKey = "";
         isLoadingLyrics = false;
+        pendingBackendPhases = 0;
         if (cfgEnabled) {
             if (isPlaying) {
                 resetPositionClock((player?.position || 0) / 1000.0, Date.now());
@@ -602,6 +776,12 @@ PlasmoidItem {
                 triggerSongChange(true);
             }
         } else {
+            fastLyricsReader.terminateAll();
+            richLyricsReader.terminateAll();
+            youtubeLyricsReader.terminateAll();
+            browserBridgeReader.terminateAll();
+            trackUrlReader.terminateAll();
+            sharedColorReader.terminateAll();
             trackUrlLookupGeneration += 1;
             colorLookupGeneration += 1;
             trackUrlRetryTimer.stop();
@@ -617,8 +797,8 @@ PlasmoidItem {
         if (!cfgEnabled) return;
         if (isPlaying) {
             resetPositionClock((player?.position || 0) / 1000.0, Date.now());
-            const key = (trackTitle + "---" + trackArtist + "---"
-                         + Math.round(trackDuration) + "---" + trackUrl).toLowerCase();
+            const key = JSON.stringify([Number(player?.instancePid || 0), trackTitle,
+                                        trackArtist, Math.round(trackDuration), trackUrl]);
             if (lyricsList.length === 0 || key !== lastLoadedTrackKey) {
                 triggerSongChange(true);
             } else {
@@ -645,25 +825,34 @@ PlasmoidItem {
             return;
         }
 
-        var key = (trackTitle + "---" + trackArtist + "---" + Math.round(trackDuration) + "---" + trackUrl).toLowerCase();
+        var key = JSON.stringify([Number(player?.instancePid || 0), trackTitle,
+                                  trackArtist, Math.round(trackDuration), trackUrl]);
         if (key === lastLoadedTrackKey && lyricsList.length > 0) return;
+        const sameTrackRefinement = lyricsList.length > 0
+            && lastFetchedTitle === trackTitle && lastFetchedArtist === trackArtist
+            && lastFetchedPlayerPid === Number(player?.instancePid || 0)
+            && (lastFetchedUrl === trackUrl || (!lastFetchedUrl && !!trackUrl));
         lastLoadedTrackKey = key;
         lastFetchedTitle = trackTitle;
         lastFetchedArtist = trackArtist;
-
-        lyricsList = [];
-        activeLineIndex = -1;
-        isLoadingLyrics = true;
-        backendQuality = -1;
-        legacyFallbackStarted = false;
-        const token = String(requestGeneration);
-        // Each lookup can render while the others continue looking for a better result.
-        fastLyricsReader.run(backendCommand("fast", token));
-        richLyricsReader.run(backendCommand("rich", token));
-        if (LyricsService.extractVideoId(trackUrl)) {
-            youtubeLyricsReader.run(backendCommand("youtube", token));
-            browserBridgeReader.run(backendCommand("bridge", token));
+        lastFetchedUrl = trackUrl;
+        lastFetchedPlayerPid = Number(player?.instancePid || 0);
+        if (!sameTrackRefinement) {
+            lyricsList = [];
+            activeLineIndex = -1;
         }
+        isLoadingLyrics = true;
+        if (!sameTrackRefinement) backendQuality = -1;
+        legacyFallbackStarted = false;
+        pendingBackendPhases = LyricsService.extractVideoId(trackUrl) ? 4 : 2;
+        sharedLookupKey = JSON.stringify([trackTitle, trackArtist, trackAlbum,
+                                         Math.round(trackDuration),
+                                         LyricsService.extractVideoId(trackUrl)]);
+        sharedCompletedPhases = ({});
+        sharedLookupActive = true;
+        // The session service performs each phase once and broadcasts results
+        // to every instance waiting for this track.
+        sharedLyricsReader.run(sharedLookupCommand(sharedLookupKey));
     }
 
     function updateActiveLine() {
@@ -695,7 +884,8 @@ PlasmoidItem {
     }
 
     function handleLineClick(timeMs) {
-        if (root.player) {
+        if (root.player && root.player.canSeek && root.lyricsList.length > 0 && !root.lyricsList[0].isUnsynced
+                && Number.isFinite(timeMs) && timeMs >= 0) {
             root.player.position = timeMs * 1000;
             resetPositionClock(timeMs, Date.now());
             refreshTimeline();
@@ -704,22 +894,86 @@ PlasmoidItem {
 
     onCfgTimingOffsetMsChanged: refreshTimeline()
 
-    // Inner container: controls visibility & smooth fade without suspending PlasmoidItem in Corona
-    Item {
-        id: contentContainer
-        anchors.fill: parent
+    function retryLyrics() {
+        if (!cfgEnabled || !isPlaying) return;
+        triggerSongChange(true);
+    }
 
-        opacity: root.shouldBeVisible ? 1.0 : 0.0
-        visible: opacity > 0.001
-
-        Behavior on opacity {
-            NumberAnimation { duration: 250; easing.type: Easing.InOutQuad }
+    compactRepresentation: PanelCompactRepresentation {
+        horizontal: Plasmoid.formFactor === PlasmaCore.Types.Horizontal
+        serviceEnabled: root.cfgEnabled
+        playing: root.isPlaying
+        loading: root.isLoadingLyrics
+        activeLine: root.activeLineIndex >= 0 && root.activeLineIndex < root.lyricsList.length
+                    ? root.lyricsList[root.activeLineIndex] : null
+        previousLine: {
+            for (let i = root.activeLineIndex - 1; i >= 0; i--) {
+                const candidate = root.lyricsList[i];
+                if (!candidate.isInstrumental && !candidate.isUnsynced
+                        && (candidate.words || "").trim()) return candidate;
+            }
+            return null;
         }
+        nextLine: root.activeLineIndex >= 0 && root.activeLineIndex + 1 < root.lyricsList.length
+                  ? root.lyricsList[root.activeLineIndex + 1] : null
+        title: root.trackTitle
+        artist: root.trackArtist
+        romanizationPrimary: root.cfgEnableRomanization && root.cfgRomanizationPrimary
+        preferredWidth: Plasmoid.configuration.panelWidth || 280
+        onActivated: root.expanded = !root.expanded
+    }
 
-        Loader {
-            anchors.fill: parent
-            active: root.lyricsList.length > 0
-            sourceComponent: root.height < 220 ? steppedViewComponent : streamViewComponent
+    fullRepresentation: Component {
+        Item {
+            Layout.minimumWidth: root.inPanel ? 280 : 200
+            Layout.minimumHeight: root.inPanel ? 220 : 40
+            Layout.preferredWidth: root.inPanel ? 480 : 400
+            Layout.preferredHeight: root.inPanel ? 420 : 100
+
+            PanelPopup {
+                anchors.fill: parent
+                visible: root.inPanel
+                serviceEnabled: root.cfgEnabled
+                playing: root.isPlaying
+                loading: root.isLoadingLyrics
+                lyricsList: root.lyricsList
+                activeLineIndex: root.activeLineIndex
+                positionMs: root.adjustedPositionMs
+                title: root.trackTitle
+                artist: root.trackArtist
+                sourceName: root.lyricsSource
+                syncType: root.lyricsSyncType
+                lyricColor: Kirigami.Theme.textColor
+                fontFamily: root.cfgFontFamily
+                fontSize: Math.min(28, root.cfgFontSize)
+                fontBold: root.cfgFontBold
+                fontItalic: root.cfgFontItalic
+                romanizationEnabled: root.cfgEnableRomanization
+                romanizationPrimary: root.cfgRomanizationPrimary
+                romanizationOpacity: root.cfgRomanizationOpacity
+                showBothScripts: root.cfgShowBothScripts
+                onRetryRequested: root.retryLyrics()
+                onStartRequested: root.setEnabledForThisMode(true)
+                onSeekRequested: function(timeMs) { root.handleLineClick(timeMs); }
+            }
+
+            // Keep the desktop presentation in the full representation.
+            Item {
+                id: contentContainer
+                anchors.fill: parent
+                visible: !root.inPanel && opacity > 0.001
+                opacity: root.inPanel ? 0 : (root.shouldBeVisible ? 1.0 : 0.0)
+
+                Behavior on opacity {
+                    NumberAnimation { duration: 250; easing.type: Easing.InOutQuad }
+                }
+
+                Loader {
+                    anchors.fill: parent
+                    active: !root.inPanel && root.lyricsList.length > 0
+                    sourceComponent: root.height < 220 ? steppedViewComponent : streamViewComponent
+                }
+            }
         }
     }
 
@@ -770,6 +1024,7 @@ PlasmoidItem {
     }
 
     Component.onCompleted: {
+        if (cfgFollowsGlobal) refreshGlobalEnabled();
         if ((Plasmoid.configuration.timingOffsetSemanticsVersion || 0) < 1) {
             // Versions through 1.1.0 added the setting to playback position,
             // so negative meant later. Preserve the actual timing while

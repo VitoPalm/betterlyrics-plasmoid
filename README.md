@@ -26,14 +26,37 @@ After installing, reload a running panel if needed with
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for the editing workflow. This repository
 is local; add your own Git remote when you want to publish or sync it.
 
-Right-click the widget and choose **Stop Better Lyrics** to suspend lyric
-fetching and playback polling. Choose **Start Better Lyrics** from the same
-menu to resume. The choice is saved for that widget instance.
+By default, right-clicking any widget and choosing **Stop Better Lyrics**
+suspends lyric fetching and playback polling in every widget that follows the
+global control. **Start Better Lyrics** resumes all those widgets. The shared
+choice persists across Plasma restarts. In General settings, turn off **Follow
+global Start/Stop** for a widget that should start and stop independently;
+its context-menu action then affects only that instance. Existing following
+instances migrate to the shared state; if any was stopped, the first migrated
+state is stopped.
+
+Place the same widget in a Plasma panel for a compact lyric strip. Horizontal
+panels use the full fixed-width allocation for lyrics: the current line wraps
+onto two rows when needed, or the next line previews below a short current
+line. When stopped, the horizontal strip is blank. Vertical panels show an icon.
+During an instrumental break, the strip shows the last sung line in the
+smaller, muted row. If that line needs both rows, it stays wrapped and muted;
+an instrumental intro shows the track title instead.
+Click to open a lyrics popup. The strip width is configurable under General.
+The popup shows an unsynced transcript without timed seeking when only plain
+lyrics are available. Desktop and panel instances keep separate display
+settings while sharing Start/Stop by default.
 
 ## Lyrics pipeline
 
-`contents/ui/lyrics_service.py` runs four generation-guarded lookups for each
-track with a YouTube Music video ID. The fast phase compares versioned Better Lyrics cache entries with
+The session service runs one in-flight lyric search per track for all widget
+instances, broadcasting each result as it arrives. Completed results stay in
+memory for 45 seconds so a newly opened instance can reuse them. A widget
+falls back to its own lookup if the service is unavailable. This sharing also
+applies to instances with independent Start/Stop settings.
+
+`contents/ui/lyrics_service.py` runs four phases for each track with a YouTube
+Music video ID. The fast phase compares versioned Better Lyrics cache entries with
 Unison, BiniLyrics, and LRCLIB. The YouTube phase requests Music's plain lyrics
 and human-authored captions. The rich phase checks cached sources and, when Zen
 has a current Better Lyrics JWT, consumes the authenticated Unified SSE stream
@@ -107,6 +130,9 @@ betterlyrics-plasmoid/
 │   │   └── main.xml                Persistent configuration schema/defaults
 │   └── ui/
 │       ├── main.qml                MPRIS selection, orchestration, timing, color
+│       ├── global_control.py       Shared Start/Stop session service
+│       ├── PanelCompactRepresentation.qml Panel lyric strip and vertical icon
+│       ├── PanelPopup.qml          Panel popup and untimed transcript
 │       ├── lyrics_service.py       Cache, network providers, SSE, text parsers
 │       ├── LyricsService.js        QML fallback providers and romanization
 │       ├── get_track_url.py        Playing-player URL/video-ID lookup over D-Bus
@@ -144,9 +170,10 @@ the package design.
    order. The extension's final bridge result takes precedence when available.
 6. `LyricsService.js` progressively adds romanization. It also provides the
    complete legacy fetch path if the Python helper fails or is unavailable.
-7. The active layout is `SteppedLyricsView.qml` below 220 px height and
-   `LyricsStreamView.qml` at 220 px or above. Clicking a timed line seeks the
-   active MPRIS player.
+7. On the desktop, the active layout is `SteppedLyricsView.qml` below 220 px
+   height and `LyricsStreamView.qml` at 220 px or above. In a panel, the compact
+   representation shows a lyric strip or icon and opens a full lyric popup.
+   Clicking a timed popup line seeks the active MPRIS player when it can seek.
 
 The widget checks the track URL and shared album-color cache on player or
 artwork changes, with short retries for late metadata and a 15-second
@@ -163,10 +190,11 @@ settings through Plasma's configuration system.
 
 ## Requirements
 
-- KDE Plasma 6 with the private MPRIS and Plasma 5 Support QML modules used by
-  the stock media widgets.
+- KDE Plasma 6 with the private MPRIS, Plasma 5 Support, and Plasma Workspace
+  D-Bus QML modules.
 - Python 3 with its standard SQLite, `ctypes`, networking, and XML modules,
-  plus Python D-Bus bindings for MPRIS URL lookup.
+  Python D-Bus bindings, and PyGObject/GLib for shared Start/Stop control and
+  lyric lookup coordination.
 - System `libsnappy` when reading Firefox IndexedDB cache entries.
 - An MPRIS-compatible player. Zen/Firefox and the Better Lyrics extension are
   optional: without them, public providers and the JavaScript fallback remain
@@ -175,6 +203,8 @@ settings through Plasma's configuration system.
 
 Node.js and `make` are needed only for development. The optional bridge runs
 only while the companion browser extension is active.
+The session service starts when any widget requests lyric results or shared
+Start/Stop state.
 
 ## Configuration
 

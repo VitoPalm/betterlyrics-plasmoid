@@ -6,6 +6,17 @@ import org.kde.kirigami as Kirigami
 import org.kde.kcmutils as KCM
 
 KCM.SimpleKCM {
+    // Hidden state still belongs to the KCM contract. Independent instances
+    // use enabled; following instances keep it for a later opt-out.
+    property bool cfg_enabled: true
+    property bool cfg_enabledDefault: true
+    // Plasma's panel layout adds these keys to the same configuration map.
+    property bool cfg_expanding: false
+    property int cfg_length: 280
+    property alias cfg_followGlobalEnabled: followGlobalCheckBox.checked
+    property bool cfg_followGlobalEnabledDefault
+    property alias cfg_panelWidth: panelWidthSpinBox.value
+    property int cfg_panelWidthDefault
     property alias cfg_fontFamily: fontFamilyField.text
     property string cfg_fontFamilyDefault
     property alias cfg_fontSize: fontSizeSpinBox.value
@@ -47,6 +58,22 @@ KCM.SimpleKCM {
     }
 
     Kirigami.FormLayout {
+        QQC2.CheckBox {
+            id: followGlobalCheckBox
+            Kirigami.FormData.label: i18n("Playback control:")
+            text: i18n("Follow global Start/Stop")
+            QQC2.ToolTip.visible: hovered
+            QQC2.ToolTip.text: i18n("Turn off to start and stop only this widget")
+        }
+
+        QQC2.SpinBox {
+            id: panelWidthSpinBox
+            from: 80
+            to: 800
+            stepSize: 20
+            Kirigami.FormData.label: i18n("Panel lyric width:")
+        }
+
         QQC2.TextField {
             id: fontFamilyField
             Kirigami.FormData.label: i18n("Font family:")

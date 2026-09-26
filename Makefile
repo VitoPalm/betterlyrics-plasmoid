@@ -11,6 +11,8 @@ check:
 test: check
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tests/lyrics_service_backend_test.py
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tests/bridge_test.py
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tests/global_control_test.py
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tests/get_track_url_test.py
 	$(NODE) tests/lyrics_service.test.js
 	$(NODE) tests/lyric_layout.test.js
 
