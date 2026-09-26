@@ -3,7 +3,7 @@
 A centered, responsive lyrics plasmoid with line, word, and syllable timing;
 album-derived colors; compact stepped and tall stream layouts; instrumental
 breaks; MPRIS seeking; a local Firefox-cache reader; concurrent fallback
-providers; and progressive rich-sync upgrades.
+providers; YouTube Music lyrics and captions; and progressive rich-sync upgrades.
 
 This directory is the independent source project for the Plasma widget. It
 does not require the Better Lyrics browser extension repository to build or
@@ -32,18 +32,63 @@ menu to resume. The choice is saved for that widget instance.
 
 ## Lyrics pipeline
 
-`contents/ui/lyrics_service.py` runs two generation-guarded lookups for each
-track. The fast phase reads an existing Better Lyrics cache entry or races
-Unison, BiniLyrics, and LRCLIB. The rich phase independently checks cached
-word/syllable results and, when Zen has a current Better Lyrics JWT, consumes
-the authenticated Unified SSE stream for GoLyrics, BiniLyrics, Portato, and
-Musixmatch. A richer result replaces an already-visible fallback without
-blanking the widget. The original QML JavaScript cascade remains the automatic
-fallback if the helper is unavailable.
+`contents/ui/lyrics_service.py` runs four generation-guarded lookups for each
+track with a YouTube Music video ID. The fast phase compares versioned Better Lyrics cache entries with
+Unison, BiniLyrics, and LRCLIB. The YouTube phase requests Music's plain lyrics
+and human-authored captions. The rich phase checks cached sources and, when Zen
+has a current Better Lyrics JWT, consumes the authenticated Unified SSE stream
+for GoLyrics, BiniLyrics, Portato, Musixmatch, LRCLIB, and Legato. Sources are
+selected in the extension's configured provider order, including disabled
+sources. The bridge phase requests the result chosen by a locally built Better
+Lyrics browser extension, including session-only lyrics and renewed credentials.
+Its result takes precedence over the standalone lookups. Better results replace
+an already-visible fallback without blanking the widget. The QML JavaScript
+cascade runs if the helper fails.
 
-The cache is opened read-only with SQLite immutable mode. The JWT is checked
-locally for expiry, used only in the request body, and never printed or copied
-into the plasmoid's own storage.
+The lyric cache is opened read-only with SQLite immutable mode; provider
+preferences are read from Zen's sync database in read-only mode. The JWT is
+checked locally for expiry, used only in the request body, and never printed or
+copied into the plasmoid's own storage.
+
+## Browser bridge for exact source selection
+
+The standalone lookups cannot always reproduce the browser result: YouTube
+captions and refreshed provider credentials may exist only in the live browser
+session. For the same result and provider choice as Better Lyrics on YouTube
+Music, use the companion changes in the Better Lyrics extension source. The
+browser must be playing the same video ID reported by MPRIS. The widget still
+uses its standalone providers while the browser result is pending or when the
+bridge is unavailable.
+
+For the Zen Flatpak on this machine, including a persistent local extension:
+
+1. Build the companion extension from the `better-lyrics` source worktree with
+   `npm ci` and `npm run build:plasmoid-bridge`. A stock Better Lyrics add-on
+   does not contain the bridge.
+2. Back up the installed signed add-on XPI from the Zen profile's `extensions/`
+   directory. In Zen's `about:config`, set `xpinstall.signatures.required` to
+   `false`. This allows unsigned add-ons throughout this Zen profile. Open
+   `about:addons`, choose **Install Add-on From File** from the gear menu, and
+   select `dist/better-lyrics-firefox-bridge.xpi`. Remove an earlier temporary
+   copy from `about:debugging` if present. In the extension's Details page,
+   set **Allow automatic updates** to **Off** so a stock release does not
+   replace the bridge. Restart Zen to confirm the extension remains enabled.
+3. Run `python3 bridge/install.py` from this project. This registers the
+   extension-scoped native messaging host inside Zen's Flatpak profile.
+4. Run `make install` and reload the Plasma panel if needed. Play a track in
+   YouTube Music and check that its MPRIS URL contains the same video ID.
+
+For a session-only development install, load the generated ZIP from
+`about:debugging` instead of changing the signature preference. To return to
+the signed add-on, remove the local build, reinstall the signed XPI or the
+published add-on, and reset `xpinstall.signatures.required` to `true`.
+
+The extension opens the native host when its background page starts. The host
+accepts widget requests on a private Unix socket, forwards only the video ID
+and display metadata to the extension, and returns the extension's selected
+provider and timed lyric lines. Tokens and lyric responses are not persisted by
+the bridge. The socket is removed when the extension disconnects. Run
+`python3 bridge/install.py --uninstall` to remove the native host registration.
 
 ## Project structure
 
@@ -54,6 +99,7 @@ betterlyrics-plasmoid/
 ├── CONTRIBUTING.md                 Development workflow
 ├── LICENSE                         GPL-3.0 license text
 ├── Makefile                        Test, package, install, and preview commands
+├── bridge/                         Zen native host and registration helper
 ├── scripts/package.py              Clean reproducible package builder
 ├── contents/
 │   ├── config/
@@ -74,6 +120,7 @@ betterlyrics-plasmoid/
 │       └── configGeneral.qml       Settings controls
 └── tests/
     ├── lyrics_service.test.js      JavaScript parser regressions
+    ├── bridge_test.py              Native host protocol test
     └── lyrics_service_backend_test.py Python parser/cache/CLI tests
 ```
 
@@ -86,15 +133,15 @@ the package design.
    metadata and interpolated position.
 2. `get_track_url.py` retrieves `xesam:url`; YouTube-style URLs supply the
    video ID used for cache keys, Unison, and Unified providers.
-3. A track change starts separate `fast` and `rich` backend processes.
+3. A track change starts separate `fast`, `youtube`, `rich`, and `bridge` backend processes.
    Responses include a request token, so results from an earlier track are
    discarded.
-4. The fast process checks Zen's cache and otherwise queries the three public
-   fallback providers concurrently. The rich process checks high-resolution
-   cache entries and optionally consumes the authenticated SSE stream.
-5. `main.qml` applies results according to the Better Lyrics provider order.
-   Equal or better timing may replace the visible fallback; lower-quality data
-   cannot downgrade it.
+4. The fast process compares Zen's cache with the three public fallback
+   providers concurrently. The YouTube process requests Music lyrics and
+   captions. The rich process checks cache entries and optionally consumes
+   the authenticated SSE stream.
+5. `main.qml` applies standalone results according to the Better Lyrics provider
+   order. The extension's final bridge result takes precedence when available.
 6. `LyricsService.js` progressively adds romanization. It also provides the
    complete legacy fetch path if the Python helper fails or is unavailable.
 7. The active layout is `SteppedLyricsView.qml` below 220 px height and
@@ -126,14 +173,19 @@ settings through Plasma's configuration system.
   available.
 - Network access for uncached lyrics and romanization.
 
-Node.js and `make` are needed only for development. No daemon or build step is
-required at runtime.
+Node.js and `make` are needed only for development. The optional bridge runs
+only while the companion browser extension is active.
 
 ## Configuration
 
 The General settings page exposes font family, size, weight/style, album-art or
 custom text color, lyric delay, syllable wobble, drop shadows, romanization,
 romanization opacity, and whether romanization becomes the primary line.
+"Show both scripts" can be disabled to show only the selected primary script.
+Lyrics wrap across the rows available at the current width; compact windows
+show an upcoming line when it fits, including a first-row preview for longer
+lines. If an active line exceeds the window height, its rows move through the
+viewport during that line's timing window.
 Lyric delay follows the browser extension's convention: positive values show
 lyrics later and negative values show them earlier. Defaults and persistent key
 types live in `contents/config/main.xml`.
@@ -168,7 +220,8 @@ For rollback, check out the earlier Git commit and run `make install` again.
 
 ## Privacy and security
 
-- Firefox databases are opened read-only using SQLite immutable mode.
+- Firefox databases are opened read-only; the IndexedDB cache uses SQLite
+  immutable mode.
 - Cached transient values are ignored after their recorded expiry.
 - JWTs are decoded only to validate expiration, never logged, returned to QML,
   or persisted by this project.
@@ -181,6 +234,11 @@ For rollback, check out the earlier Git commit and run `make install` again.
 
 - Unified SSE requires an unexpired token already issued to the Better Lyrics
   browser extension. This plasmoid does not automate Turnstile or renew tokens.
+- YouTube's caption URLs can return empty data outside the browser session;
+  caption availability therefore depends on YouTube's response to the desktop
+  request. Music lyrics are queried through the same `next` and `browse` API
+  paths the extension observes, but account-only lyrics may require the
+  browser's logged-in session.
 - The Firefox decoder intentionally supports only JSON-like structured-clone
   values used by extension storage. Unsupported future cache formats are
   ignored and fall back to network providers.

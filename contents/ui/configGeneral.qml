@@ -34,6 +34,8 @@ KCM.SimpleKCM {
     property real cfg_romanizationOpacityDefault
     property alias cfg_romanizationPrimary: romanizationPrimaryCheckBox.checked
     property bool cfg_romanizationPrimaryDefault
+    property alias cfg_showBothScripts: showBothScriptsCheckBox.checked
+    property bool cfg_showBothScriptsDefault
 
     Component.onCompleted: {
         // The schema retains the old sign/default solely so main.qml can
@@ -106,6 +108,16 @@ KCM.SimpleKCM {
             id: romanizationPrimaryCheckBox
             visible: enableRomanizationCheckBox.checked
             Kirigami.FormData.label: i18n("Romanization as primary text:")
+        }
+
+        QQC2.CheckBox {
+            id: showBothScriptsCheckBox
+            visible: enableRomanizationCheckBox.checked
+            Kirigami.FormData.label: i18n("Show both scripts:")
+            QQC2.ToolTip.visible: hovered
+            QQC2.ToolTip.text: romanizationPrimaryCheckBox.checked
+                ? i18n("Turn off to show only romanized lyrics")
+                : i18n("Turn off to show only original lyrics")
         }
 
         QQC2.SpinBox {

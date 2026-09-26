@@ -19,6 +19,7 @@ Item {
     property bool enableRomanization: true
     property real romanizationOpacity: 0.72
     property bool romanizationPrimary: false
+    property bool showBothScripts: true
 
     signal lineClicked(int timeMs)
 
@@ -28,53 +29,8 @@ Item {
                                                 Math.floor(height * (height < 65 ? 0.52 : 0.38))))
     readonly property double singleLineH: Math.round(displayFontSize * 1.35)
     readonly property double lineGap: Math.max(3, Math.round(displayFontSize * 0.22))
-    readonly property bool canWrapActive: height >= singleLineH * 1.9
-    readonly property bool canShowPreview: height >= singleLineH * 2.15
-
-    function computeActiveTargetY(isWrapped, hasRomanization) {
-        if (steppedRoot.height < 65) {
-            return Math.max(0, Math.round((steppedRoot.height - singleLineH) / 2));
-        }
-        var romanizationH = hasRomanization ? Math.round(displayFontSize * 0.66) : 0;
-        if (isWrapped) {
-            var wrappedH = Math.round(singleLineH * 2 + lineGap + romanizationH);
-            return Math.max(2, Math.round((steppedRoot.height - wrappedH) / 2));
-        }
-        if (hasRomanization) {
-            return Math.max(2, Math.round((steppedRoot.height - singleLineH - romanizationH) / 2));
-        }
-        // Push active line higher when a next preview line will be displayed below it
-        return Math.max(2, Math.round(steppedRoot.height * 0.08));
-    }
-
-    readonly property double nextTargetY: {
-        var actY = computeActiveTargetY(false, false);
-        return actY + singleLineH + lineGap;
-    }
-
-    TextMetrics {
-        id: measureMetrics
-        font.family: steppedRoot.fontFamily
-        font.pixelSize: steppedRoot.displayFontSize
-        font.bold: steppedRoot.fontBold
-        font.italic: steppedRoot.fontItalic
-    }
-
-    function checkLineWillWrap(lineData) {
-        if (!lineData || lineData.isInstrumental) return false;
-        if (!steppedRoot.canWrapActive) return false;
-        if (steppedRoot.width <= 120) return false;
-        var swap = steppedRoot.enableRomanization && steppedRoot.romanizationPrimary
-                && (lineData.romanization || "").trim().length > 0;
-        var words = (swap ? lineData.romanization : (lineData.words || "")).trim();
-        if (!words) return false;
-        measureMetrics.text = words;
-        var maxW = Math.max(24, steppedRoot.width - 24);
-        if (measureMetrics.width <= maxW) return false;
-        if (!swap && lineData.parts && lineData.parts.length >= 2) return true;
-        var w = words.split(/\s+/);
-        return w.length >= 2;
-    }
+    property double nextTargetY: 0
+    property bool pendingResizeLayout: false
 
     // 1. Outgoing line (slides up and fades out)
     LyricLineDelegate {
@@ -96,6 +52,7 @@ Item {
         enableShadow: steppedRoot.enableShadow
         enableRomanization: steppedRoot.enableRomanization
         romanizationOpacity: steppedRoot.romanizationOpacity
+        showSecondary: steppedRoot.showBothScripts
         currentPositionMs: 0
     }
 
@@ -119,6 +76,7 @@ Item {
         enableShadow: steppedRoot.enableShadow
         enableRomanization: steppedRoot.enableRomanization
         romanizationOpacity: steppedRoot.romanizationOpacity
+        showSecondary: steppedRoot.showBothScripts
         currentPositionMs: steppedRoot.currentPositionMs
 
         onLineClicked: function(timeMs) {
@@ -146,6 +104,7 @@ Item {
         enableShadow: steppedRoot.enableShadow
         enableRomanization: steppedRoot.enableRomanization
         romanizationOpacity: steppedRoot.romanizationOpacity
+        showSecondary: steppedRoot.showBothScripts
         currentPositionMs: 0
 
         onLineClicked: function(timeMs) {
@@ -192,6 +151,12 @@ Item {
         id: activeSlideAnim
         property double fromY: 0
         property double toY: 0
+        onFinished: {
+            if (steppedRoot.pendingResizeLayout) {
+                steppedRoot.pendingResizeLayout = false;
+                steppedRoot.syncActiveLine(steppedRoot.activeLineIndex, -1);
+            }
+        }
 
         NumberAnimation {
             target: activeDelegate
@@ -260,81 +225,111 @@ Item {
     }
 
     function syncActiveLine(newIdx, oldIdx) {
-        if (!lyricsList || lyricsList.length === 0 || newIdx < 0 || newIdx >= lyricsList.length) {
+        if (!lyricsList || newIdx < 0 || newIdx >= lyricsList.length) {
+            layoutGeneration++;
+            prevSlideAnim.stop();
+            activeSlideAnim.stop();
+            nextSlideAnim.stop();
             activeDelegate.visible = false;
             nextDelegate.visible = false;
             prevDelegate.visible = false;
             return;
         }
 
-        var isAdvance = (oldIdx >= 0 && newIdx === oldIdx + 1);
-        var activeData = lyricsList[newIdx];
-        var willWrap = checkLineWillWrap(activeData);
-        var hasRomanization = steppedRoot.enableRomanization && activeData
-                && (activeData.romanization || "").trim().length > 0;
-        var hasNext = (newIdx + 1 < lyricsList.length);
-        var nextData = hasNext ? lyricsList[newIdx + 1] : null;
-
-        if (isAdvance) {
-            // 1. Outgoing line: slide up and fade out
-            var oldData = lyricsList[oldIdx];
-            // Keep the completed line lit during its short exit instead of
-            // snapping it to the inactive color before the motion begins.
-            copyLineData(prevDelegate, oldData, oldIdx, true);
+        var advance = oldIdx >= 0 && newIdx === oldIdx + 1;
+        var incomingY = nextDelegate.visible ? nextDelegate.y : steppedRoot.height;
+        var outgoingY = activeDelegate.y;
+        if (advance) {
+            copyLineData(prevDelegate, lyricsList[oldIdx], oldIdx, true);
+            prevDelegate.showSecondary = activeDelegate.showSecondary;
             prevDelegate.forceSingleLine = false;
+            prevDelegate.previewFirstRow = false;
+            prevDelegate.maxVisibleHeight = steppedRoot.height;
+            prevDelegate.currentPositionMs = (lyricsList[oldIdx].startTimeMs || 0)
+                                            + (lyricsList[oldIdx].durationMs || 0);
             prevDelegate.visible = true;
-            prevSlideAnim.fromY = activeDelegate.y;
+            prevSlideAnim.fromY = outgoingY;
             prevSlideAnim.restart();
-
-            // 2. Incoming active line: starts from next line position/scale and expands
-            copyLineData(activeDelegate, activeData, newIdx, true);
-            activeDelegate.forceSingleLine = !steppedRoot.canWrapActive;
-            activeDelegate.visible = true;
-
-            activeSlideAnim.fromY = nextTargetY;
-            activeSlideAnim.toY = computeActiveTargetY(willWrap, hasRomanization);
-            activeSlideAnim.restart();
-
-            // 3. Next line preview: only shown if active line is NOT wrapped
-            if (hasNext && !willWrap && !hasRomanization && steppedRoot.canShowPreview) {
-                copyLineData(nextDelegate, nextData, newIdx + 1, false);
-                nextDelegate.forceSingleLine = true;
-                nextDelegate.visible = true;
-                nextDelegate.scale = 0.70;
-                nextSlideAnim.restart();
-            } else {
-                nextSlideAnim.stop();
-                nextDelegate.visible = false;
-                nextDelegate.opacity = 0.0;
-            }
         } else {
-            // Non-consecutive change (song change, seek, initial load)
             prevSlideAnim.stop();
             activeSlideAnim.stop();
             nextSlideAnim.stop();
             prevDelegate.visible = false;
-
-            copyLineData(activeDelegate, activeData, newIdx, true);
-            activeDelegate.forceSingleLine = !steppedRoot.canWrapActive;
-            activeDelegate.visible = true;
-            activeDelegate.scale = 1.0;
-            activeDelegate.opacity = 1.0;
-            activeDelegate.y = computeActiveTargetY(willWrap, hasRomanization);
-
-            if (hasNext && !willWrap && !hasRomanization && steppedRoot.canShowPreview) {
-                copyLineData(nextDelegate, nextData, newIdx + 1, false);
-                nextDelegate.forceSingleLine = true;
-                nextDelegate.visible = true;
-                nextDelegate.scale = 0.70;
-                nextDelegate.opacity = 0.42;
-                nextDelegate.y = nextTargetY;
-            } else {
-                nextDelegate.visible = false;
-                nextDelegate.opacity = 0.0;
-            }
         }
+
+        copyLineData(activeDelegate, lyricsList[newIdx], newIdx, true);
+        activeDelegate.forceSingleLine = steppedRoot.height < steppedRoot.singleLineH * 1.25;
+        activeDelegate.previewFirstRow = false;
+        activeDelegate.showSecondary = steppedRoot.showBothScripts;
+        activeDelegate.maxVisibleHeight = Math.max(1, steppedRoot.height - 4);
+        activeDelegate.visible = true;
+
+        var hasNext = newIdx + 1 < lyricsList.length;
+        nextDelegate.visible = false;
+        if (hasNext) {
+            copyLineData(nextDelegate, lyricsList[newIdx + 1], newIdx + 1, false);
+            nextDelegate.forceSingleLine = false;
+            nextDelegate.previewFirstRow = false;
+            nextDelegate.showSecondary = steppedRoot.showBothScripts;
+            nextDelegate.maxVisibleHeight = 0;
+        }
+
+        // Repeater rows are built during the next event-loop pass. Make the
+        // fit choice only after their implicit heights have settled.
+        var generation = ++layoutGeneration;
+        Qt.callLater(function() {
+            if (generation !== layoutGeneration) return;
+            var activePrimaryHeight = activeDelegate.contentHeight
+                                    + activeDelegate.renderedFontSize * 0.15;
+            if (activeDelegate.showRomanization
+                    && activeDelegate.implicitHeight > activeDelegate.maxVisibleHeight
+                    && activePrimaryHeight <= activeDelegate.maxVisibleHeight)
+                activeDelegate.showSecondary = false;
+
+            if (hasNext) {
+                var available = steppedRoot.height - activeDelegate.height - steppedRoot.lineGap - 4;
+                var nextPrimaryHeight = nextDelegate.contentHeight
+                                      + nextDelegate.renderedFontSize * 0.15;
+                if (nextDelegate.showRomanization && nextDelegate.implicitHeight > available)
+                    nextDelegate.showSecondary = false;
+                if (nextPrimaryHeight > available) nextDelegate.previewFirstRow = true;
+            }
+            Qt.callLater(function() {
+                if (generation !== layoutGeneration) return;
+                var available = steppedRoot.height - activeDelegate.height - steppedRoot.lineGap - 4;
+                var previewFits = hasNext && available >= nextDelegate.implicitHeight
+                                  && available >= steppedRoot.singleLineH * 0.65;
+                var combinedHeight = activeDelegate.height
+                                   + (previewFits ? steppedRoot.lineGap + nextDelegate.height : 0);
+                var activeY = Math.max(2, Math.round((steppedRoot.height - combinedHeight) / 2));
+                nextTargetY = activeY + activeDelegate.height + steppedRoot.lineGap;
+                if (advance) {
+                    activeSlideAnim.fromY = incomingY;
+                    activeSlideAnim.toY = activeY;
+                    activeSlideAnim.restart();
+                } else {
+                    activeDelegate.scale = 1.0;
+                    activeDelegate.opacity = 1.0;
+                    activeDelegate.y = activeY;
+                }
+                if (previewFits) {
+                    nextDelegate.visible = true;
+                    nextDelegate.scale = 0.70;
+                    if (advance) nextSlideAnim.restart();
+                    else {
+                        nextDelegate.opacity = 0.42;
+                        nextDelegate.y = nextTargetY;
+                    }
+                } else {
+                    nextSlideAnim.stop();
+                    nextDelegate.visible = false;
+                    nextDelegate.opacity = 0;
+                }
+            });
+        });
     }
 
+    property int layoutGeneration: 0
     property int lastActiveIndex: -1
 
     onActiveLineIndexChanged: {
@@ -349,12 +344,22 @@ Item {
     }
 
     onWidthChanged: {
-        if (!activeSlideAnim.running) syncActiveLine(activeLineIndex, -1);
+        if (activeSlideAnim.running) pendingResizeLayout = true;
+        else syncActiveLine(activeLineIndex, -1);
     }
 
     onHeightChanged: {
-        if (!activeSlideAnim.running) syncActiveLine(activeLineIndex, -1);
+        if (activeSlideAnim.running) pendingResizeLayout = true;
+        else syncActiveLine(activeLineIndex, -1);
     }
+
+    onShowBothScriptsChanged: syncActiveLine(activeLineIndex, -1)
+    onRomanizationPrimaryChanged: syncActiveLine(activeLineIndex, -1)
+    onEnableRomanizationChanged: syncActiveLine(activeLineIndex, -1)
+    onDisplayFontSizeChanged: syncActiveLine(activeLineIndex, -1)
+    onFontFamilyChanged: syncActiveLine(activeLineIndex, -1)
+    onFontBoldChanged: syncActiveLine(activeLineIndex, -1)
+    onFontItalicChanged: syncActiveLine(activeLineIndex, -1)
 
     Component.onCompleted: {
         syncActiveLine(activeLineIndex, -1);

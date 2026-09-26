@@ -89,6 +89,7 @@ PlasmoidItem {
                                                     ? Plasmoid.configuration.romanizationOpacity : 0.72
     readonly property bool cfgRomanizationPrimary: Plasmoid.configuration.romanizationPrimary !== undefined
                                                     ? Plasmoid.configuration.romanizationPrimary : false
+    readonly property bool cfgShowBothScripts: Plasmoid.configuration.showBothScripts !== false
     // Optional shared color cache, with the artwork average as fallback.
     property color sharedAlbumArtColor: Kirigami.Theme.highlightColor
     property bool sharedAlbumArtReady: false
@@ -287,6 +288,7 @@ PlasmoidItem {
     property string lastFetchedArtist: ""
     property int requestGeneration: 0
     property int backendQuality: -1
+    property int backendResultRevision: 0
     property bool legacyFallbackStarted: false
 
     readonly property string backendScriptPath: decodeURIComponent(
@@ -323,6 +325,7 @@ PlasmoidItem {
         const quality = Number(result.quality || 0);
         if (quality < backendQuality) return true;
         backendQuality = quality;
+        backendResultRevision += 1;
         lyricsList = result.lines.slice(0);
         lyricsSource = result.source || "";
         lyricsSyncType = result.syncType || "";
@@ -330,8 +333,10 @@ PlasmoidItem {
         refreshTimeline();
         if (cfgEnableRomanization) {
             const expectedGeneration = requestGeneration;
+            const expectedRevision = backendResultRevision;
             LyricsService.enrichRomanization(result, LyricsService.extractVideoId(trackUrl), function(err, enriched) {
-                if (!err && expectedGeneration === requestGeneration && enriched?.lines) {
+                if (!err && expectedGeneration === requestGeneration
+                        && backendResultRevision === expectedRevision && enriched?.lines) {
                     lyricsList = enriched.lines.slice(0);
                     refreshTimeline();
                 }
@@ -368,12 +373,28 @@ PlasmoidItem {
             try { payload = JSON.parse(stdout.trim()); } catch (error) {}
             const tokenMatch = cmd.match(/--request-token '([^']+)'/);
             const token = payload?.requestToken || (tokenMatch ? tokenMatch[1] : "");
-            if (!root.applyBackendResult(payload)) root.startLegacyFallback(token);
+            if (!root.applyBackendResult(payload) && (!payload || payload.error)) {
+                root.startLegacyFallback(token);
+            }
         }
     }
 
     RunCommand {
         id: richLyricsReader
+        onExited: (cmd, exitCode, exitStatus, stdout, stderr) => {
+            try { root.applyBackendResult(JSON.parse(stdout.trim())); } catch (error) {}
+        }
+    }
+
+    RunCommand {
+        id: youtubeLyricsReader
+        onExited: (cmd, exitCode, exitStatus, stdout, stderr) => {
+            try { root.applyBackendResult(JSON.parse(stdout.trim())); } catch (error) {}
+        }
+    }
+
+    RunCommand {
+        id: browserBridgeReader
         onExited: (cmd, exitCode, exitStatus, stdout, stderr) => {
             try { root.applyBackendResult(JSON.parse(stdout.trim())); } catch (error) {}
         }
@@ -636,10 +657,13 @@ PlasmoidItem {
         backendQuality = -1;
         legacyFallbackStarted = false;
         const token = String(requestGeneration);
-        // The two processes are independent: fast fallbacks can render while
-        // the authenticated stream continues looking for richer timing.
+        // Each lookup can render while the others continue looking for a better result.
         fastLyricsReader.run(backendCommand("fast", token));
         richLyricsReader.run(backendCommand("rich", token));
+        if (LyricsService.extractVideoId(trackUrl)) {
+            youtubeLyricsReader.run(backendCommand("youtube", token));
+            browserBridgeReader.run(backendCommand("bridge", token));
+        }
     }
 
     function updateActiveLine() {
@@ -717,6 +741,7 @@ PlasmoidItem {
             enableRomanization: root.cfgEnableRomanization
             romanizationOpacity: root.cfgRomanizationOpacity
             romanizationPrimary: root.cfgRomanizationPrimary
+            showBothScripts: root.cfgShowBothScripts
             onLineClicked: function(timeMs) { root.handleLineClick(timeMs); }
         }
     }
@@ -739,6 +764,7 @@ PlasmoidItem {
             enableRomanization: root.cfgEnableRomanization
             romanizationOpacity: root.cfgRomanizationOpacity
             romanizationPrimary: root.cfgRomanizationPrimary
+            showBothScripts: root.cfgShowBothScripts
             onLineClicked: function(timeMs) { root.handleLineClick(timeMs); }
         }
     }

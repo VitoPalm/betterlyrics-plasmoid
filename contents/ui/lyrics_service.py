@@ -21,8 +21,10 @@ import ctypes.util
 import gzip
 import html
 import json
+import os
 import re
 import sqlite3
+import socket
 import struct
 import sys
 import time
@@ -30,10 +32,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from functools import lru_cache
 from pathlib import Path
 
 
 USER_AGENT = "BetterLyrics-Plasma/2.0"
+YOUTUBE_USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+LYRIC_CACHE_VERSION = "2.1.0"
 UNISON_URL = "https://unison.betterlyrics.org/lyrics"
 BINIMUM_URL = "https://lyrics-api.binimum.org/"
 LRCLIB_GET_URL = "https://lrclib.net/api/get"
@@ -53,14 +59,75 @@ PROVIDER_PRIORITY = {
     "musixmatch-richsync": 5,
     "bLyrics-synced": 6,
     "unison-synced": 7,
+    "yt-captions": 8,
     "binimum-synced": 9,
     "lrclib-synced": 10,
     "legato-synced": 11,
     "musixmatch-synced": 12,
+    "yt-lyrics": 13,
     "unison-plain": 14,
     "lrclib-plain": 15,
 }
 RICH_KEYS = {key for key in PROVIDER_PRIORITY if "rich" in key or "word" in key or "portato" in key}
+UNIFIED_KEYS = {
+    "bLyrics-richsynced", "bLyrics-synced", "binimum-richsynced", "binimum-synced",
+    "portato-richsynced", "musixmatch-richsync", "musixmatch-synced",
+    "lrclib-synced", "lrclib-plain", "legato-synced",
+}
+EXTENSION_ID = "betterlyrics@boidu.dev"
+
+
+@lru_cache(maxsize=1)
+def preferred_provider_order():
+    """Match the extension's merged storage.sync order, including d_ disables."""
+    defaults = list(PROVIDER_PRIORITY)
+    stored = None
+    for database in zen_database_paths():
+        sync_database = database.parents[4] / "storage-sync-v2.sqlite"
+        if not sync_database.exists():
+            continue
+        try:
+            with contextlib.closing(sqlite3.connect(sync_database.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+                row = db.execute("SELECT data FROM storage_sync_data WHERE ext_id = ?", (EXTENSION_ID,)).fetchone()
+                if row:
+                    document = json.loads(row[0])
+                    value = document.get("preferredProviderList") if isinstance(document, dict) else None
+                    if isinstance(value, list):
+                        stored = [item for item in value if isinstance(item, str)]
+                        break
+        except (OSError, sqlite3.Error, ValueError):
+            continue
+    if stored is None:
+        return defaults
+    merged = stored[:]
+    def index_of(key):
+        return next((i for i, item in enumerate(merged) if item.removeprefix("d_") == key), -1)
+    for default_index, key in enumerate(defaults):
+        if index_of(key) >= 0:
+            continue
+        insert_at = -1
+        for before in range(default_index - 1, -1, -1):
+            predecessor = index_of(defaults[before])
+            if predecessor >= 0:
+                insert_at = predecessor + 1
+                break
+        if insert_at < 0:
+            for after in range(default_index + 1, len(defaults)):
+                successor = index_of(defaults[after])
+                if successor >= 0:
+                    insert_at = successor
+                    break
+        if insert_at < 0:
+            insert_at = len(merged)
+        merged.insert(insert_at, key)
+    return [key for key in merged if key in PROVIDER_PRIORITY]
+
+
+def provider_rank(provider: str):
+    try:
+        return preferred_provider_order().index(provider)
+    except ValueError:
+        return None
 
 
 def request(url: str, *, data: bytes | None = None, headers: dict[str, str] | None = None, timeout: float = 8.0):
@@ -314,6 +381,9 @@ def parse_qrc(value: str, duration_ms: int):
 
 
 def normalize_cached_result(provider: str, value: dict, duration_ms: int):
+    rank = provider_rank(provider)
+    if rank is None or not isinstance(value, dict) or value.get("version") != LYRIC_CACHE_VERSION:
+        return None
     lyrics = value.get("lyrics")
     if not isinstance(lyrics, list) or not lyrics:
         return None
@@ -322,13 +392,21 @@ def normalize_cached_result(provider: str, value: dict, duration_ms: int):
         if not isinstance(item, dict) or not isinstance(item.get("words"), str):
             continue
         normalized.append(line(item.get("startTimeMs", 0), item.get("durationMs", 0), item["words"], item.get("parts"),
-                               unsynced=provider.endswith("plain")))
+                               unsynced=provider.endswith("plain") or provider == "yt-lyrics"))
     if not normalized:
         return None
     finish_durations(normalized, duration_ms)
-    sync_type = "syllable" if any(item.get("parts") for item in normalized) else ("none" if provider.endswith("plain") else "line")
+    sync_type = provider_sync_type(provider, normalized)
     return {"source": value.get("source") or provider, "provider": provider, "syncType": sync_type,
-            "quality": 100 - PROVIDER_PRIORITY.get(provider, 99), "lines": normalized, "cache": "zen"}
+            "quality": 100 - rank, "lines": normalized, "cache": "zen"}
+
+
+def provider_sync_type(provider: str, lines: list[dict]):
+    if provider in ("unison-wordsynced", "portato-richsynced", "musixmatch-richsync"):
+        return "word"
+    if provider.endswith("plain") or provider == "yt-lyrics":
+        return "none"
+    return "syllable" if any(item.get("parts") for item in lines) else "line"
 
 
 class CloneDecoder:
@@ -477,112 +555,397 @@ def decode_transient(item):
         if value.startswith(COMPRESSED_PREFIX):
             value = gzip.decompress(base64.b64decode(value[len(COMPRESSED_PREFIX):])).decode("utf-8")
         parsed = json.loads(value)
-        return None if parsed.get("missing") is True else parsed
-    except (ValueError, OSError, json.JSONDecodeError):
+        return parsed if isinstance(parsed, dict) and parsed.get("missing") is not True else None
+    except (ValueError, OSError):
         return None
 
 
-def cached_lyrics(video_id: str, duration_ms: int, rich_only=False):
+def cached_lyrics(video_id: str, duration_ms: int, rich_only=False, providers=None):
     if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id or ""):
         return None
-    providers = [key for key in PROVIDER_PRIORITY if not rich_only or key in RICH_KEYS]
-    keys = {f"blyrics_{video_id}_{provider}" for provider in providers}
+    selected = [key for key in PROVIDER_PRIORITY if (not rich_only or key in RICH_KEYS)
+                and (providers is None or key in providers)]
+    keys = {f"blyrics_{video_id}_{provider}" for provider in selected}
     stored = read_zen_storage(keys)
     candidates = []
-    for provider in providers:
+    for provider in selected:
         value = decode_transient(stored.get(f"blyrics_{video_id}_{provider}"))
         result = normalize_cached_result(provider, value, duration_ms) if value else None
         if result:
             candidates.append(result)
-    return min(candidates, key=lambda item: PROVIDER_PRIORITY[item["provider"]]) if candidates else None
+    return best_result(*candidates)
+
+
+def cached_metadata(video_id: str):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id or ""):
+        return None
+    key = f"blyrics_{video_id}_metadata"
+    data = decode_transient(read_zen_storage({key}).get(key))
+    return data if data and data.get("version") == LYRIC_CACHE_VERSION else None
+
+
+def best_result(*items):
+    candidates = [item for item in items if item and provider_rank(item["provider"]) is not None]
+    return min(candidates, key=lambda item: provider_rank(item["provider"])) if candidates else None
+
+
+def extension_key_id():
+    identity = read_zen_storage({"userIdentity"}).get("userIdentity")
+    if isinstance(identity, dict) and isinstance(identity.get("keyId"), str):
+        return identity["keyId"]
+    return "better-lyrics-default"
 
 
 def unison(meta):
     if not meta.video_id:
         return None
-    query = urllib.parse.urlencode({"v": meta.video_id, "song": meta.title, "artist": meta.artist, "duration": meta.duration})
-    data = get_json(f"{UNISON_URL}?{query}")
+    query = {"v": meta.video_id, "song": meta.title, "artist": meta.artist, "duration": meta.duration}
+    if meta.album:
+        query["album"] = meta.album
+    data = json.loads(request(f"{UNISON_URL}?{urllib.parse.urlencode(query)}",
+                              headers={"x-key-id": extension_key_id()}, timeout=10))
     payload = data.get("data", data)
     lyrics = payload.get("lyrics") if isinstance(payload, dict) else None
     if not lyrics:
         return None
-    if payload.get("format") == "ttml" or "<tt" in lyrics:
+    format_name = payload.get("format")
+    if format_name == "ttml" or "<tt" in lyrics:
         lines = parse_ttml(lyrics, meta.duration_ms)
-    elif payload.get("format") == "plain":
+    elif format_name == "plain":
         lines = parse_plain(lyrics, meta.duration_ms)
     else:
         lines = parse_lrc(lyrics, meta.duration_ms)
-    rich = payload.get("syncType") == "richsync" or any(item.get("parts") for item in lines)
-    provider = "unison-richsynced" if rich else ("unison-plain" if lines and lines[0]["isUnsynced"] else "unison-synced")
+    if format_name == "plain":
+        provider = "unison-plain"
+    elif format_name == "lrc":
+        provider = "unison-wordsynced" if payload.get("syncType") == "richsync" else "unison-synced"
+    else:
+        provider = "unison-richsynced" if any(item.get("parts") for item in lines) else "unison-synced"
     return result("Unison", provider, lines)
 
 
 def binimum(meta):
-    query = urllib.parse.urlencode({"track": meta.title, "artist": meta.artist, "album": meta.album, "duration": meta.duration})
-    data = get_json(f"{BINIMUM_URL}?{query}")
-    entries = data.get("results", []) if isinstance(data, dict) else []
-    if not entries or not entries[0].get("lyricsUrl"):
-        return None
-    lyrics = request(entries[0]["lyricsUrl"])
-    lines = parse_ttml(lyrics, meta.duration_ms)
-    rich = any(item.get("parts") for item in lines)
-    return result("BiniLyrics", "binimum-richsynced" if rich else "binimum-synced", lines)
+    queries = []
+    if meta.duration:
+        full = {"track": meta.title, "artist": meta.artist, "duration": meta.duration}
+        if meta.album:
+            full["album"] = meta.album
+        queries.append(full)
+    stripped = re.sub(r"\s*[\[(](?:feat\.?|ft\.?|featuring)\b.*?[\])]", "", meta.title, flags=re.I).strip()
+    queries.append({"track": stripped or meta.title, "artist": meta.artist.replace("，", ",")})
+    for query in queries:
+        try:
+            data = get_json(f"{BINIMUM_URL}?{urllib.parse.urlencode(query)}")
+            entries = data.get("results", []) if isinstance(data, dict) else []
+            if not entries or not entries[0].get("lyricsUrl"):
+                continue
+            lines = parse_ttml(request(entries[0]["lyricsUrl"]), meta.duration_ms)
+            if lines:
+                rich = any(item.get("parts") for item in lines)
+                return result("BiniLyrics", "binimum-richsynced" if rich else "binimum-synced", lines)
+        except (urllib.error.URLError, ValueError, OSError):
+            continue
+    return None
 
 
 def match_score(item, meta):
     normalize = lambda value: re.sub(r"[^\w]+", " ", (value or "").casefold()).strip()
     title, artist = normalize(meta.title), normalize(meta.artist)
     candidate_title, candidate_artist = normalize(item.get("trackName") or item.get("name")), normalize(item.get("artistName"))
-    score = 80 if title == candidate_title else (30 if title in candidate_title or candidate_title in title else 0)
-    score += 50 if artist == candidate_artist else (20 if artist in candidate_artist or candidate_artist in artist else 0)
+    score = 80 if title and title == candidate_title else (30 if candidate_title and title and (title in candidate_title or candidate_title in title) else 0)
+    score += 50 if artist and artist == candidate_artist else (20 if candidate_artist and artist and (artist in candidate_artist or candidate_artist in artist) else 0)
     if meta.duration and item.get("duration"):
         score += max(-50, 35 - abs(float(item["duration"]) - meta.duration) * 3)
     return score
 
 
 def lrclib(meta):
-    exact = urllib.parse.urlencode({"track_name": meta.title, "artist_name": meta.artist, "album_name": meta.album, "duration": meta.duration})
+    exact_query = {"track_name": meta.title, "artist_name": meta.artist}
+    if meta.album:
+        exact_query["album_name"] = meta.album
+    if meta.duration:
+        exact_query["duration"] = meta.duration
+    plain = None
     try:
-        data = get_json(f"{LRCLIB_GET_URL}?{exact}")
-        entries = [data]
+        data = get_json(f"{LRCLIB_GET_URL}?{urllib.parse.urlencode(exact_query)}")
+        if isinstance(data, dict):
+            if data.get("syncedLyrics"):
+                synced = result("LRCLIB", "lrclib-synced", parse_lrc(data["syncedLyrics"], meta.duration_ms))
+                if synced:
+                    return synced
+            if data.get("plainLyrics"):
+                plain = result("LRCLIB", "lrclib-plain", parse_plain(data["plainLyrics"], meta.duration_ms))
     except (urllib.error.URLError, urllib.error.HTTPError, ValueError):
-        query = urllib.parse.urlencode({"track_name": meta.title, "artist_name": meta.artist})
-        entries = get_json(f"{LRCLIB_SEARCH_URL}?{query}")
-    if not isinstance(entries, list):
+        pass
+    stripped = re.sub(r"\s*[\[(](?:feat\.?|ft\.?)\b.*?[\])]", "", meta.title, flags=re.I).strip() or meta.title
+    artist = re.sub(r"[·•]", " ", meta.artist).strip()
+    searches = (
+        {"track_name": stripped, "artist_name": artist},
+        {"q": f"{stripped} {artist}".strip()},
+    )
+    for query in searches:
+        try:
+            entries = get_json(f"{LRCLIB_SEARCH_URL}?{urllib.parse.urlencode(query)}")
+        except (urllib.error.URLError, ValueError):
+            continue
+        if not isinstance(entries, list):
+            continue
+        entries = sorted((item for item in entries if isinstance(item, dict)),
+                         key=lambda item: match_score(item, meta), reverse=True)
+        for item in entries:
+            if item.get("syncedLyrics"):
+                lines = parse_lrc(item["syncedLyrics"], meta.duration_ms)
+                if lines:
+                    synced = result("LRCLIB", "lrclib-synced", lines)
+                    if synced:
+                        return synced
+        for item in entries:
+            if item.get("plainLyrics") and not plain:
+                plain = result("LRCLIB", "lrclib-plain", parse_plain(item["plainLyrics"], meta.duration_ms))
+    return plain
+
+
+def embedded_json(page: str, marker: str):
+    match = re.search(marker + r"\s*[:=]\s*", page)
+    if not match:
         return None
-    entries.sort(key=lambda item: match_score(item, meta), reverse=True)
-    for item in entries:
-        if item.get("syncedLyrics"):
-            return result("LRCLIB", "lrclib-synced", parse_lrc(item["syncedLyrics"], meta.duration_ms))
-    for item in entries:
-        if item.get("plainLyrics"):
-            return result("LRCLIB", "lrclib-plain", parse_plain(item["plainLyrics"], meta.duration_ms))
-    return None
+    try:
+        return json.JSONDecoder().raw_decode(page[match.end():])[0]
+    except ValueError:
+        return None
+
+
+def youtube_page(video_id: str, *, music=False):
+    host = "music.youtube.com" if music else "www.youtube.com"
+    url = f"https://{host}/watch?v={urllib.parse.quote(video_id)}"
+    req = urllib.request.Request(url, headers={"User-Agent": YOUTUBE_USER_AGENT,
+                                               "Accept-Language": "en-US,en;q=0.9"})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        return response.read(3_000_000).decode("utf-8", "replace")
+
+
+def youtube_api(endpoint: str, api_key: str, context: dict, payload: dict, video_id: str):
+    url = f"https://music.youtube.com/youtubei/v1/{endpoint}?key={urllib.parse.quote(api_key)}"
+    body = json.dumps({"context": context, **payload}).encode()
+    req = urllib.request.Request(url, data=body, headers={
+        "User-Agent": YOUTUBE_USER_AGENT, "Content-Type": "application/json",
+        "Origin": "https://music.youtube.com",
+        "Referer": f"https://music.youtube.com/watch?v={video_id}",
+    })
+    with urllib.request.urlopen(req, timeout=10) as response:
+        return json.load(response)
+
+
+def nested(value, *keys):
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def yt_music_lyrics(meta):
+    if not meta.video_id:
+        return None
+    page = youtube_page(meta.video_id, music=True)
+    api_key = embedded_json(page, r'"INNERTUBE_API_KEY"')
+    context = embedded_json(page, r'"INNERTUBE_CONTEXT"')
+    if not isinstance(api_key, str) or not isinstance(context, dict):
+        return None
+    next_data = youtube_api("next", api_key, context, {"videoId": meta.video_id}, meta.video_id)
+    tabs = nested(next_data, "contents", "singleColumnMusicWatchNextResultsRenderer", "tabbedRenderer",
+                  "watchNextTabbedResultsRenderer", "tabs") or []
+    if len(tabs) < 2:
+        return None
+    tab = tabs[1].get("tabRenderer", {})
+    if tab.get("unselectable"):
+        return None
+    browse_id = nested(tab, "endpoint", "browseEndpoint", "browseId")
+    if not browse_id:
+        return None
+    data = youtube_api("browse", api_key, context, {"browseId": browse_id}, meta.video_id)
+    shelf = nested(data, "contents", "sectionListRenderer", "contents") or []
+    if not shelf:
+        return None
+    shelf = shelf[0].get("musicDescriptionShelfRenderer", {})
+    text_runs = nested(shelf, "description", "runs") or []
+    source_runs = nested(shelf, "footer", "runs") or []
+    if not text_runs or not source_runs:
+        return None
+    lyrics = text_runs[0].get("text", "")
+    source_text = source_runs[0].get("text", "")
+    if not lyrics or not source_text:
+        return None
+    source = source_text[8:] + " (via YT)"
+    return result(source, "yt-lyrics", parse_plain(lyrics, meta.duration_ms))
+
+
+def parse_youtube_captions(data):
+    if not isinstance(data, dict):
+        return []
+    lines = []
+    for event in data.get("events", []):
+        if not isinstance(event, dict) or not isinstance(event.get("segs"), list):
+            continue
+        words = "".join(segment.get("utf8", "") for segment in event["segs"] if isinstance(segment, dict))
+        words = words.replace("\n", " ").strip(" \t♪𝅘𝅥𝅮𝅘𝅥𝅯𝅘𝅥𝅰𝅘𝅥𝅱𝅘𝅥𝅲")
+        if words:
+            lines.append(line(event.get("tStartMs", 0), event.get("dDurationMs", 0), words))
+    if lines and all(item["words"].upper() == item["words"] for item in lines):
+        for item in lines:
+            item["words"] = item["words"][:1].upper() + item["words"][1:].lower()
+    return lines
+
+
+def yt_captions(meta):
+    if not meta.video_id:
+        return None
+    page = youtube_page(meta.video_id)
+    player = embedded_json(page, r"ytInitialPlayerResponse")
+    tracks = nested(player, "captions", "playerCaptionsTracklistRenderer", "captionTracks") or []
+    if not tracks:
+        return None
+    if len(tracks) == 1:
+        lang = tracks[0].get("languageCode")
+    else:
+        auto = next((track for track in tracks if track.get("kind") == "asr"), None)
+        lang = auto.get("languageCode") if auto else None
+    if not lang:
+        return None
+    selected = next((track for track in tracks if track.get("kind") != "asr"
+                     and track.get("languageCode", "").split("-")[0] == lang.split("-")[0]), None)
+    if not selected or not selected.get("baseUrl"):
+        return None
+    parsed_url = urllib.parse.urlparse(selected["baseUrl"])
+    query = urllib.parse.parse_qsl(parsed_url.query, keep_blank_values=True)
+    query = [(key, value) for key, value in query if key != "fmt"] + [("fmt", "json3")]
+    url = urllib.parse.urlunparse(parsed_url._replace(query=urllib.parse.urlencode(query)))
+    req = urllib.request.Request(url, headers={"User-Agent": YOUTUBE_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        lines = parse_youtube_captions(json.load(response))
+    return result("YouTube Captions", "yt-captions", lines)
 
 
 def result(source, provider, lines):
-    if not lines:
+    rank = provider_rank(provider)
+    if not lines or rank is None:
         return None
     return {"source": source, "provider": provider,
-            "syncType": "syllable" if any(item.get("parts") for item in lines) else ("none" if lines[0].get("isUnsynced") else "line"),
-            "quality": 100 - PROVIDER_PRIORITY.get(provider, 99), "lines": lines}
+            "syncType": provider_sync_type(provider, lines),
+            "quality": 100 - rank, "lines": lines}
 
 
 def fast_phase(meta):
     cached = cached_lyrics(meta.video_id, meta.duration_ms)
-    if cached:
+    if cached and provider_rank(cached["provider"]) == 0:
         return cached
     candidates = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(provider, meta) for provider in (unison, binimum, lrclib)]
+        futures = [executor.submit(provider, meta) for provider in
+                   (unison, binimum, lrclib)]
         for future in concurrent.futures.as_completed(futures):
             try:
                 value = future.result()
                 if value:
                     candidates.append(value)
-            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, OSError):
+            except (urllib.error.URLError, TimeoutError, ValueError, TypeError, KeyError, OSError):
                 pass
-    return max(candidates, key=lambda item: item["quality"]) if candidates else None
+    return best_result(cached, *candidates)
+
+
+def youtube_phase(meta):
+    if not meta.video_id:
+        return None
+    candidates = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(provider, meta) for provider in (yt_music_lyrics, yt_captions)]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                candidates.append(future.result())
+            except (urllib.error.URLError, TimeoutError, ValueError, TypeError, KeyError, OSError):
+                pass
+    return best_result(*candidates)
+
+
+def bridge_socket_path():
+    override = os.environ.get("BETTERLYRICS_BRIDGE_SOCKET")
+    if override:
+        return Path(override)
+    return (Path.home() / ".var/app/app.zen_browser.zen/cache/"
+            "betterlyrics-plasmoid-bridge/bridge.sock")
+
+
+def segment_shift(segment_map, time_ms):
+    shift = 0
+    if not isinstance(segment_map, dict):
+        return shift
+    for segment in segment_map.get("segment", []):
+        if not isinstance(segment, dict):
+            continue
+        counterpart = segment.get("counterpartVideoStartTimeMilliseconds")
+        primary = segment.get("primaryVideoStartTimeMilliseconds")
+        duration = segment.get("durationMilliseconds")
+        if not all(isinstance(value, (int, float)) for value in (counterpart, primary, duration)):
+            continue
+        if time_ms >= counterpart:
+            shift = primary - counterpart
+            if time_ms <= counterpart + duration:
+                break
+    return shift
+
+
+def normalize_bridge_result(value, meta):
+    if not isinstance(value, dict) or value.get("playbackVideoId") != meta.video_id:
+        return None
+    provider = value.get("provider")
+    if provider not in PROVIDER_PRIORITY or not isinstance(value.get("lyrics"), list):
+        return None
+    normalized = []
+    for item in value["lyrics"]:
+        if not isinstance(item, dict) or not isinstance(item.get("words"), str):
+            continue
+        try:
+            lyric = line(item.get("startTimeMs", 0), item.get("durationMs", 0), item["words"], item.get("parts"),
+                         unsynced=provider.endswith("plain") or provider == "yt-lyrics")
+        except (TypeError, ValueError):
+            continue
+        lyric["isInstrumental"] = item.get("isInstrumental") is True
+        if isinstance(item.get("romanization"), str):
+            lyric["romanization"] = item["romanization"]
+        if value.get("segmentMap") and not lyric["isUnsynced"]:
+            lyric["startTimeMs"] += segment_shift(value["segmentMap"], lyric["startTimeMs"])
+            for part in lyric["parts"]:
+                part["startTimeMs"] += segment_shift(value["segmentMap"], part["startTimeMs"])
+        normalized.append(lyric)
+    if not normalized:
+        return None
+    finish_durations(normalized, meta.duration_ms)
+    return {"source": value.get("source") or provider, "provider": provider,
+            "syncType": provider_sync_type(provider, normalized), "quality": 1000,
+            "lines": normalized, "bridge": True}
+
+
+def bridge_phase(meta):
+    path = bridge_socket_path()
+    if not meta.video_id or not path.is_socket():
+        return None
+    request_value = {"videoId": meta.video_id, "title": meta.title, "artist": meta.artist,
+                     "album": meta.album, "duration": meta.duration}
+    try:
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.settimeout(62)
+            connection.connect(str(path))
+            connection.sendall(json.dumps(request_value, separators=(",", ":")).encode() + b"\n")
+            with connection.makefile("rb") as stream:
+                raw = stream.readline(1_000_001)
+        if not raw or len(raw) > 1_000_000:
+            return None
+        response = json.loads(raw)
+        if response.get("ok") is not True:
+            return None
+        return normalize_bridge_result(response.get("result"), meta)
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def jwt_expiry(token: str):
@@ -594,84 +957,154 @@ def jwt_expiry(token: str):
         return 0
 
 
-def unified_result(provider, results, meta):
+def unified_results(provider, results, meta):
+    """Map every provider event to the extension's source keys."""
+    if not isinstance(results, dict):
+        return []
+    found = []
     try:
-        if provider == "musixmatch" and results.get("wordByWord"):
-            return result("Musixmatch", "musixmatch-richsync", parse_lrc(results["wordByWord"], meta.duration_ms))
-        if provider == "qq" and results.get("lyrics"):
-            payload = json.loads(results["lyrics"])
-            return result("Better Lyrics Portato", "portato-richsynced", parse_qrc(payload.get("lyrics", ""), meta.duration_ms))
-        if provider == "golyrics" and results.get("lyrics"):
+        if provider == "musixmatch":
+            if results.get("wordByWord"):
+                found.append(result("Musixmatch", "musixmatch-richsync",
+                                    parse_lrc(results["wordByWord"], meta.duration_ms)))
+            if results.get("synced"):
+                found.append(result("Musixmatch", "musixmatch-synced",
+                                    parse_lrc(results["synced"], meta.duration_ms)))
+        elif provider == "lrclib":
+            if results.get("synced"):
+                found.append(result("LRCLib", "lrclib-synced", parse_lrc(results["synced"], meta.duration_ms)))
+            if results.get("plain"):
+                found.append(result("LRCLib", "lrclib-plain", parse_plain(results["plain"], meta.duration_ms)))
+        elif provider == "kugou" and results.get("lyrics"):
+            payload = json.loads(results["lyrics"]) if isinstance(results["lyrics"], str) else results["lyrics"]
+            found.append(result("Better Lyrics Legato", "legato-synced",
+                                parse_lrc(payload.get("lyrics", ""), meta.duration_ms)))
+        elif provider == "qq" and results.get("lyrics"):
+            payload = json.loads(results["lyrics"]) if isinstance(results["lyrics"], str) else results["lyrics"]
+            found.append(result("Better Lyrics Portato", "portato-richsynced",
+                                parse_qrc(payload.get("lyrics", ""), meta.duration_ms)))
+        elif provider == "golyrics" and results.get("lyrics"):
             lyrics = results["lyrics"]
             try:
-                lyrics = json.loads(lyrics).get("ttml", lyrics)
-            except (ValueError, AttributeError):
+                parsed = json.loads(lyrics)
+                if isinstance(parsed, dict):
+                    lyrics = parsed.get("ttml", lyrics)
+            except (ValueError, TypeError):
                 pass
             lines = parse_ttml(lyrics, meta.duration_ms)
-            return result("betterlyrics.org", "bLyrics-richsynced" if any(item.get("parts") for item in lines) else "bLyrics-synced", lines)
-        if provider == "binimum" and results.get("lyrics"):
+            key = "bLyrics-richsynced" if any(item.get("parts") for item in lines) else "bLyrics-synced"
+            found.append(result("betterlyrics.org", key, lines))
+        elif provider == "binimum" and results.get("lyrics"):
             lines = parse_ttml(results["lyrics"], meta.duration_ms)
-            rich = results.get("timingType") == "syllable" or any(item.get("parts") for item in lines)
-            return result("BiniLyrics", "binimum-richsynced" if rich else "binimum-synced", lines)
+            timing = results.get("timingType")
+            rich = timing == "syllable" or (timing != "line" and any(item.get("parts") for item in lines))
+            found.append(result("BiniLyrics", "binimum-richsynced" if rich else "binimum-synced", lines))
     except (ValueError, TypeError, AttributeError):
-        return None
-    return None
+        return []
+    return [item for item in found if item]
+
+
+def process_sse_event(event, data_lines, meta):
+    if not data_lines:
+        return []
+    try:
+        payload = json.loads("".join(data_lines))
+    except (ValueError, TypeError):
+        return []
+    if event == "metadata" and isinstance(payload, dict):
+        for key, attribute in (("song", "title"), ("artist", "artist"), ("album", "album")):
+            if payload.get(key):
+                setattr(meta, attribute, payload[key])
+        try:
+            if float(payload.get("duration") or 0) > 0:
+                meta.duration = round(float(payload["duration"]))
+                meta.duration_ms = meta.duration * 1000
+        except (ValueError, TypeError):
+            pass
+    if event == "provider" and isinstance(payload, dict):
+        return unified_results(payload.get("provider"), payload.get("results"), meta)
+    return []
+
+
+def clean_track_title(value: str):
+    value = re.sub(r"\s*\|\s*YouTube Music$", "", value, flags=re.I)
+    value = re.sub(r"\s*[\[(](?:Official\s+)?(?:Music\s+)?(?:Video|Audio|Lyric\s+Video|Visualizer)[\])]",
+                   "", value, flags=re.I)
+    return value.strip()
+
+
+def clean_track_artist(value: str):
+    return re.sub(r"\s*-\s*Topic$", "", value, flags=re.I).strip()
 
 
 def rich_phase(meta):
-    cached = cached_lyrics(meta.video_id, meta.duration_ms, rich_only=True)
-    if cached:
+    cached = cached_lyrics(meta.video_id, meta.duration_ms, providers=UNIFIED_KEYS | RICH_KEYS)
+    if cached and provider_rank(cached["provider"]) == 0:
         return cached
     if not meta.video_id:
-        return None
+        return cached
     stored = read_zen_storage({"jwtToken"})
     token = stored.get("jwtToken")
     if not isinstance(token, str) or jwt_expiry(token) <= time.time() + 15:
-        return None
-    body = urllib.parse.urlencode({"videoId": meta.video_id, "song": meta.title, "artist": meta.artist,
-                                   "album": meta.album, "duration": meta.duration,
-                                   "alwaysFetchMetadata": "false", "token": token}).encode()
+        return cached
+    body_values = {"videoId": meta.video_id, "alwaysFetchMetadata": "false", "token": token}
+    if meta.title:
+        body_values["song"] = meta.title
+    if meta.artist:
+        body_values["artist"] = meta.artist
+    if meta.album:
+        body_values["album"] = meta.album
+    if meta.duration:
+        body_values["duration"] = meta.duration
+    body = urllib.parse.urlencode(body_values).encode()
     req = urllib.request.Request(UNIFIED_URL, data=body, method="POST", headers={
         "User-Agent": USER_AGENT, "Accept": "text/event-stream",
         "Content-Type": "application/x-www-form-urlencoded", "Origin": "https://betterlyrics.org",
     })
-    candidates = []
-    with urllib.request.urlopen(req, timeout=22) as response:
-        event, data_lines = "", []
-        for raw in response:
-            text = raw.decode("utf-8", "replace").rstrip("\r\n")
-            if not text:
-                if data_lines:
-                    try:
-                        payload = json.loads("".join(data_lines))
-                        if event == "provider":
-                            candidate = unified_result(payload.get("provider"), payload.get("results") or {}, meta)
-                            if candidate:
-                                candidates.append(candidate)
-                    except json.JSONDecodeError:
-                        pass
-                event, data_lines = "", []
-            elif text.startswith("event:"):
-                event = text[6:].strip()
-            elif text.startswith("data:"):
-                data_lines.append(text[5:].strip())
-    return max(candidates, key=lambda item: item["quality"]) if candidates else None
+    candidates = [cached] if cached else []
+    try:
+        with urllib.request.urlopen(req, timeout=22) as response:
+            event, data_lines = "", []
+            for raw in response:
+                text = raw.decode("utf-8", "replace").rstrip("\r\n")
+                if not text:
+                    candidates.extend(process_sse_event(event, data_lines, meta))
+                    event, data_lines = "", []
+                elif text.startswith("event:"):
+                    event = text[6:].strip()
+                elif text.startswith("data:"):
+                    data_lines.append(text[5:].strip())
+            candidates.extend(process_sse_event(event, data_lines, meta))
+    except (urllib.error.URLError, TimeoutError, OSError):
+        pass
+    return best_result(*candidates)
 
 
 class Metadata:
     def __init__(self, args):
         decode = lambda value: urllib.parse.unquote(value or "")
-        self.title = decode(args.title).strip()
-        self.artist = decode(args.artist).strip()
+        self.title = clean_track_title(decode(args.title))
+        self.artist = clean_track_artist(decode(args.artist))
         self.album = decode(args.album).strip()
         self.video_id = decode(args.video_id).strip()
         self.duration = max(0, round(args.duration or 0))
         self.duration_ms = self.duration * 1000
+        metadata = cached_metadata(self.video_id)
+        if metadata:
+            for key, attribute in (("song", "title"), ("artist", "artist"), ("album", "album")):
+                if isinstance(metadata.get(key), str) and metadata[key].strip():
+                    setattr(self, attribute, metadata[key].strip())
+            try:
+                if float(metadata.get("duration") or 0) > 0:
+                    self.duration = round(float(metadata["duration"]))
+                    self.duration_ms = self.duration * 1000
+            except (ValueError, TypeError):
+                pass
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--phase", choices=("fast", "rich"), required=True)
+    parser.add_argument("--phase", choices=("fast", "rich", "youtube", "bridge"), required=True)
     parser.add_argument("--title", required=True)
     parser.add_argument("--artist", default="")
     parser.add_argument("--album", default="")
@@ -681,12 +1114,13 @@ def main():
     args = parser.parse_args()
     meta = Metadata(args)
     try:
-        output = fast_phase(meta) if args.phase == "fast" else rich_phase(meta)
+        output = {"fast": fast_phase, "rich": rich_phase, "youtube": youtube_phase,
+                  "bridge": bridge_phase}[args.phase](meta)
         print(json.dumps({"ok": bool(output), "phase": args.phase, "requestToken": args.request_token,
                           "result": output}, ensure_ascii=False, separators=(",", ":")))
-    except Exception as error:  # Keep errors out of Plasma's process and away from tokens.
+    except Exception as error:  # Network errors can contain the JWT-bearing request URL.
         print(json.dumps({"ok": False, "phase": args.phase, "requestToken": args.request_token,
-                          "error": f"{type(error).__name__}: {error}"}, separators=(",", ":")))
+                          "error": type(error).__name__}, separators=(",", ":")))
 
 
 if __name__ == "__main__":
